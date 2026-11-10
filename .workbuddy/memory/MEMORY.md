@@ -44,7 +44,10 @@
   CLI 命名安装包，`scripts/release.ps1` 打 tag。不要用 `CARGO_PKG_VERSION`（读 Cargo.toml，会漂）。
 - **发版签名私钥**在 `%USERPROFILE%\.tauri\yolo-trainer.key`，不入库；公钥写在 `tauri.conf.json`。
 - **NSIS 更新产物是 `<setup>.exe` + `<setup>.exe.sig`，没有 `.nsis.zip`**；签名内容嵌进
-  `latest.json`，Release 只传 2 个资产。`.sig` 不带版本 → 别开 `requireSignedVersion`。
+  `latest.json`，Release 只传 2 个资产。`.sig` **带** `version:` → 已启用 `requireSignedVersion`
+  （判断签名格式要 base64 解码全文，别只看前 300 字符）。
+- **Release 资产名不能含空格**：`gh` 会把空格换成点，按原件名拼的 URL 会 404。
+  `release.ps1` 上传无空格副本 `YOLO-Trainer_<ver>_…exe`，URL/核对/补传都用它。
 - `scripts/*.ps1` 必须 UTF-8 BOM + CRLF（PowerShell 5.1 按 GBK 解无 BOM 文件）。
 
 ## 当前架构决策（详见 docs/DECISIONS.md）

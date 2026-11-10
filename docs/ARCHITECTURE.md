@@ -212,8 +212,8 @@ scripts/release.ps1                    GitHub Release
 
 **信任边界**：feed 走 HTTPS 但本身不签名，签名只覆盖下载的安装包。所以插件先验签再运行安装器，
 `install_update` 另做一次"远端版本必须比当前新"的显式判断，防止把旧 Release 的合法签名
-配上一个虚高的版本号实现降级。`requireSignedVersion` 暂未启用（CLI 2.12.4 的签名不带版本，
-见 D023）。
+配上一个虚高的版本号实现降级。`requireSignedVersion` **已启用**：CLI 2.12.4 的签名带
+`version:` 字段，不带它的签名会被直接拒绝（D023）。
 
 **为什么不是 zip 覆盖**：NSIS 安装写注册表与卸载项，且 `externalBin` 与 WebView2 DLL 在主进程
 运行时被占用。详见 D020。

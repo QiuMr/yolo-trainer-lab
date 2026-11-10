@@ -451,7 +451,7 @@ montgomery stdout ──▶ hub ──▶ 订阅线程 ──┬─▶ RunState�
   "pub_date": "2026-11-11T02:30:00Z",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://github.com/QiuMr/yolo-trainer-lab/releases/download/v0.1.1/YOLO%20Trainer_0.1.1_x64-setup.exe",
+      "url": "https://github.com/QiuMr/yolo-trainer-lab/releases/download/v0.1.1/YOLO-Trainer_0.1.1_x64-setup.exe",
       "signature": "<base64 字符串，内容就是 .exe.sig 文件>"
     }
   }
@@ -462,7 +462,8 @@ montgomery stdout ──▶ hub ──▶ 订阅线程 ──┬─▶ RunState�
 - `pub_date` 是 RFC3339 UTC。
 - 平台键：插件依次尝试 `windows-x86_64-nsis` 和 `windows-x86_64`，命中任一即可。
   NSIS 是本项目唯一目标，用通用键。
-- `url` 里的空格**必须** percent-encode（`[uri]::EscapeDataString`），否则下载 404。
+- 资产名**不能含空格**：`gh` 会把空格换成点，按原件名拼的 URL 必然 404。发版脚本上传
+  无空格副本 `YOLO-Trainer_<ver>_x64-setup.exe`，`url` 直接用它，不需要 percent-encode（D023）。
 - `signature` 是 `.exe.sig` 文件的全部内容（base64 编码的 minisign 签名），首尾空白要去掉。
 - JSON **必须无 BOM**：serde_json 遇到 BOM 直接解析失败，而每次启动都要读它。
 
@@ -472,11 +473,13 @@ montgomery stdout ──▶ hub ──▶ 订阅线程 ──┬─▶ RunState�
 
 | 文件 | 是否上传 | 用途 |
 | --- | --- | --- |
-| `YOLO Trainer_<ver>_x64-setup.exe` | 是 | 用户手动安装 + 更新器下载 |
+| `YOLO Trainer_<ver>_x64-setup.exe` | 否（本地原件） | Tauri 产出的安装包 |
 | `YOLO Trainer_<ver>_x64-setup.exe.sig` | 否 | 内容嵌进 `latest.json.signature` |
+| `YOLO-Trainer_<ver>_x64-setup.exe` | **是** | 无空格上传副本，内容与原件逐字节相同 |
 
-Release 资产共两个：安装包与 `latest.json`。`scripts/release.ps1` 会核对两者都在
-（gh 上传大文件中断时可能留下只有 JSON 的空壳 Release），缺了自动补传。
+Release 资产共两个：上传副本与 `latest.json`。**必须用无空格副本**：`gh release create`
+会把资产名里的空格替换成点，按原件名拼的 URL 会 404（D023）。`scripts/release.ps1`
+会核对两者都在（gh 上传大文件中断时可能留下只有 JSON 的空壳 Release），缺了自动补传。
 
 ### 10.6 失败语义（重要）
 
@@ -489,5 +492,7 @@ Release 资产共两个：安装包与 `latest.json`。`scripts/release.ps1` 会
 | 签名不匹配 | 下载阶段报错，安装包**不会运行**（插件先验签再 `install`） |
 | 安装成功 | Windows 上进程退出 → NSIS `/P` 静默安装 → `/R` 自动重启 |
 
-私钥在 `%USERPROFILE%\.tauri\yolo-trainer.key`，不入库。`requireSignedVersion` **未启用**：
-Tauri CLI 2.12.4 的 `.sig` trusted comment 只带 `timestamp` 与 `file`，启用会让当前所有包被拒。
+私钥在 `%USERPROFILE%\.tauri\yolo-trainer.key`，不入库。`requireSignedVersion` **已启用**：
+CLI 2.12.4 的签名 trusted comment 是 `timestamp:…\tfile:…\tversion:<ver>`，**带版本**；
+启用后不带版本字段的签名一律拒绝，防止拿旧签名配虚高版本号强制降级。若存量 Release
+由更老的 CLI 签过（不带 version），必须重签重发才能被新客户端接受（D023）。

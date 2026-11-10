@@ -443,16 +443,27 @@ AI 客户端调用 curl / fetch 也更简单：一次请求一次响应，不需
 
 ---
 
-## D023 · 签名私钥不入库，且暂不启用 `requireSignedVersion`
+## D023 · 签名私钥不入库，启用 `requireSignedVersion`
 
 **决定**：私钥在 `%USERPROFILE%\.tauri\yolo-trainer.key`，`.gitignore` 明确排除 `*.key`；仓库里
-只有公钥字符串。`tauri.conf.json` 不设 `requireSignedVersion`。
+只有公钥字符串。`tauri.conf.json` 设 `requireSignedVersion: true`。
 
 **理由**：私钥泄漏等于任何人都能发布"通过校验"的假更新，这是不可回滚的事故。
-`requireSignedVersion` 要求签名的 trusted comment 里带版本号；实测 Tauri CLI 2.12.4 生成的
-`.sig` 只带 `timestamp` 与 `file`，启用会让当前所有包被拒。**等 CLI 开始写版本号、并把所有
-存量 Release 重新签过之后再开**，否则客户端会集体升级失败。
+`requireSignedVersion` 要求签名的 trusted comment 里必须带 `version:` 字段。实测 Tauri CLI
+2.12.4 生成的 `.sig` **base64 解码全文**是
+`timestamp:…\tfile:…\tversion:0.1.0`，确实带版本，所以启用没有兼容风险。它堵住的是：
+有人拿一个不带版本字段的旧合法签名，配上虚高的 `latest.json.version` 来强制降级。
+（插件即使不开这个开关，只要签名里带 version 也会比对一致性；开关额外要求"必须带"。）
 
-**附带结论**：NSIS 目标下 `createUpdaterArtifacts: true` 产出的是 `<setup>.exe` + `<setup>.exe.sig`，
-**没有 `.nsis.zip`**。签名字符串嵌进 `latest.json`，所以 Release 只需上传安装包与 `latest.json`
-两个资产。发版脚本最初按 `.nsis.zip` 写，是实测产物名之后改的。
+**一次误判，记下来**：最初只看了 `.sig` 的前 300 个字符，见到 `timestamp` 与 `file` 就断定
+"CLI 不写版本"，据此写了"不能启用"。完整解码才发现 `version:` 在 trusted comment 末尾。
+**判断签名格式必须解码全文，不能 head 一段。**
+
+**附带结论 1 · 产物形态**：NSIS 目标下 `createUpdaterArtifacts: true` 产出的是
+`<setup>.exe` + `<setup>.exe.sig`，**没有 `.nsis.zip`**。签名字符串嵌进 `latest.json`，Release
+只需上传安装包与 `latest.json` 两个资产。发版脚本最初按 `.nsis.zip` 写，是实测产物名之后改的。
+
+**附带结论 2 · gh 会改资产名**：`gh release create` 把文件名里的空格替换成点
+（`YOLO Trainer_…` → `YOLO.Trainer_…`）。后果是 `latest.json` 里 `%20` 编码的 URL 必然 404，
+按本地文件名核对资产也永远不匹配。→ 上传前复制一份无空格名 `YOLO-Trainer_<ver>_…exe`，
+URL、核对、补传统一用它；文件内容不变，签名仍然有效。

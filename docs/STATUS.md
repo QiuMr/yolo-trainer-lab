@@ -27,12 +27,17 @@
 | `scripts/release.ps1` | ✅ UTF-8 BOM + CRLF，PowerShell 解析 0 错误 |
 | 版本号 | `build.rs` 从 `tauri.conf.json` 注入 `YOLO_TRAINER_VERSION`，三段数字断言 |
 
-**产物形态（实测，与直觉不同）**：NSIS 目标下 `createUpdaterArtifacts: true` 产出的是
-`<setup>.exe` + `<setup>.exe.sig`，**没有 `.nsis.zip`**。签名内容嵌进 `latest.json`，Release 只传
-安装包与 `latest.json` 两个资产。发版脚本最初按 zip 写，是看了实际产物后改的（D023）。
+**发版实测，三个与预期不符的地方**（D023）：
 
-**仍未验证**：真实跨版本升级（需要第二个 Release）；`requireSignedVersion`（CLI 2.12.4 的
-签名 trusted comment 不带版本，启用会拒掉现有包）。
+1. NSIS 目标下 `createUpdaterArtifacts: true` 产出 `<setup>.exe` + `<setup>.exe.sig`，
+   **没有 `.nsis.zip`**。签名内容嵌进 `latest.json`，Release 只传安装包与 `latest.json`。
+2. `gh` 把资产名里的**空格换成点**（`YOLO Trainer_…` → `YOLO.Trainer_…`），首次发版因此
+   `%20` URL 404、资产核对永远不匹配。→ 上传无空格副本 `YOLO-Trainer_<ver>_…exe`。
+   **v0.1.0 是踩坑版，v0.1.1 是修正版**，两个版本也用来演练真实升级。
+3. 签名 trusted comment **带 `version:`**（初次只看前 300 字符误判成不带）。据此启用
+   `requireSignedVersion`，堵住用旧签名强制降级的攻击。
+
+**仍未验证**：真实跨版本升级（v0.1.1 发布后用旧版客户端演练）；独显机器上的 GPU 训练。
 
 ## 关键体积
 
@@ -220,7 +225,7 @@ let time_measurement = if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
 - [ ] 决定是否把 `MONTGOMERY_WGPU_BACKEND` / `CUBECL_WGPU_TIMING` 保留为正式功能
 - [ ] 明确桌面壳的开源许可证：README 已写清"公开可见但未指定许可"，对外分发前要定
 - [ ] 真实跨版本升级演练：用旧版点「下载并安装」升到新版（需要第二个 Release）
-- [ ] `requireSignedVersion`：等 Tauri CLI 在签名里写版本号，并重签所有存量 Release 后再开（D023）
+- [x] `requireSignedVersion`——已启用：CLI 2.12.4 的签名确实带 `version:`（D023）
 - [ ] 人工过一遍拖文件夹进窗口的手势、托盘菜单
 - [x] 本地控制服务（AI 操控）——已完成
 - [x] 模型选择器（63 个全开放）——已完成

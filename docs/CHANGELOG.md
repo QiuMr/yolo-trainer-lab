@@ -32,12 +32,18 @@
 | `src/components/UpdateCard.tsx` | 新增：设置页「版本与更新」，挂载静默检查 + 6 h 缓存（失败不缓存）+ 进度 + 一键安装 |
 | `scripts/release.ps1` | 新增：校验 → 构建 → 生成无 BOM `latest.json` → push/tag → Release → 核对资产并补传 |
 
-**实测发现的产物形态**：NSIS 下 `createUpdaterArtifacts: true` 产出 `<setup>.exe` + `<setup>.exe.sig`，
-**没有 `.nsis.zip`**。签名字符串嵌进 `latest.json`，Release 只需两个资产。脚本最初按 zip 写，
-看到真实产物后改的（D023）。
+**发版实测，三个都不是猜得出来的**（D023）：
 
-`.sig` 的 trusted comment 只有 `timestamp` 与 `file`，**不带版本**，所以没有启用
-`requireSignedVersion`——启用会让当前所有包被客户端拒绝（D023）。
+1. NSIS 下 `createUpdaterArtifacts: true` 产出 `<setup>.exe` + `<setup>.exe.sig`，
+   **没有 `.nsis.zip`**。签名字符串嵌进 `latest.json`，Release 只需两个资产。脚本最初按 zip 写。
+2. **gh 把资产名里的空格换成点**：`YOLO Trainer_…` → `YOLO.Trainer_…`。首次发版因此
+   `latest.json` 的 `%20` URL 必然 404，资产核对也永远不匹配。修法：上传前复制成无空格名
+   `YOLO-Trainer_<ver>_…exe`，URL/核对/补传统一用它；内容不变，签名仍有效。
+   **v0.1.0 是踩坑版，v0.1.1 是修好后重发的**，两个 Release 也顺便用来演练真实升级。
+3. **签名其实带 `version:`**：`.sig` base64 解码全文的 trusted comment 是
+   `timestamp:…\tfile:…\tversion:0.1.0`。初次只 `head -c 300` 看前半段，误判成"不带版本"，
+   据此写了"不能启用 requireSignedVersion"。纠正后**启用该开关**，堵住"用不带版本字段的旧
+   合法签名 + 虚高版本号"强制降级。判断签名格式必须解码全文。
 
 ### 实测
 

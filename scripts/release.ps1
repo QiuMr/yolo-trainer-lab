@@ -149,10 +149,19 @@ foreach ($p in @($setup, $sig)) {
 Ok ("安装包 {0:N1} MiB" -f ((Get-Item $setup).Length / 1MB))
 Ok ("签名 {0} 字符" -f ((Get-Item $sig).Length))
 
-# ── 7. latest.json ────────────────────────────────────────────────────────
+# ── 7. 上传副本 + latest.json ─────────────────────────────────────────────
+# gh 会把资产名里的**空格替换成点**："YOLO Trainer_..." -> "YOLO.Trainer_..."。
+# 实测后果有两个：latest.json 里 %20 编码的 URL 会 404；按本地文件名核对资产永远不匹配。
+# 所以上传前复制成不含空格的名字，URL、资产核对、补传统一用它。文件内容不变，签名仍有效。
+if (-not (Test-Path $releaseDir)) { New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null }
+$uploadName = "YOLO-Trainer_${ver}_x64-setup.exe"
+$uploadExe = Join-Path $releaseDir $uploadName
+Copy-Item $setup $uploadExe -Force
+Info "上传副本：$uploadName"
+
 # URL 指向**本版本**的 Release 资产，而不是 latest/download ——
 # latest.json 自己由 latest/download 指过来，再指回去会绕圈。
-$assetUrl = "https://github.com/$slug/releases/download/$tag/" + [uri]::EscapeDataString((Split-Path -Leaf $setup))
+$assetUrl = "https://github.com/$slug/releases/download/$tag/$uploadName"
 $signature = ([System.IO.File]::ReadAllText($sig, [System.Text.UTF8Encoding]::new($false))).Trim()
 if (-not $signature) { Fail "$sig 是空的，签名没有生成" }
 
@@ -163,7 +172,6 @@ if ($NotesFile) {
 if (-not $Notes) { $Notes = (Invoke-Git @("log", "-1", "--pretty=format:%s")).Out }
 if (-not $Notes) { $Notes = "发布 $tag" }
 
-if (-not (Test-Path $releaseDir)) { New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null }
 $latestPath = Join-Path $releaseDir "latest.json"
 $latest = [ordered]@{
   version  = $ver
@@ -192,7 +200,7 @@ if ($tagPush.Code -ne 0) { Fail "推送 tag 失败：$($tagPush.Out)" }
 
 $ghArgs = @(
   "release", "create", $tag,
-  $setup, $latestPath,
+  $uploadExe, $latestPath,
   "--repo", $slug,
   "--title", "YOLO Trainer $tag",
   "--notes", $Notes
@@ -202,14 +210,14 @@ Info "创建 Release..."
 & $gh @ghArgs | Out-Host
 
 # ── 9. 核对资产（判据，不用退出码）───────────────────────────────────────
-# gh 上传大文件中断时会留下「只有 latest.json、没有 zip」的空壳 Release。
+# gh 上传大文件中断时会留下「只有 latest.json、没有安装包」的空壳 Release。
 # 直接问 GitHub 资产全不全，比读 $LASTEXITCODE 可靠。
 function Get-AssetNames {
   $v = Invoke-Gh @("release", "view", $tag, "--repo", $slug, "--json", "assets")
   if ($v.Code -ne 0) { return $null }
   try { return @(($v.Out | ConvertFrom-Json).assets | ForEach-Object { $_.name }) } catch { return $null }
 }
-$expected = @((Split-Path -Leaf $setup), "latest.json")
+$expected = @($uploadName, "latest.json")
 $names = Get-AssetNames
 if ($null -eq $names) { Fail "读不到 Release 资产列表，请手动检查 https://github.com/$slug/releases/tag/$tag" }
 $missing = @($expected | Where-Object { $names -notcontains $_ })
@@ -218,7 +226,7 @@ if ($missing.Count -gt 0) {
   $retry = @("release", "upload", $tag)
   foreach ($m in $missing) {
     if ($m -eq "latest.json") { $retry += $latestPath }
-    else { $retry += $setup }
+    else { $retry += $uploadExe }
   }
   $retry += @("--clobber", "--repo", $slug)
   Invoke-Gh $retry | Out-Null
