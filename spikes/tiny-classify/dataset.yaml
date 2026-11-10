@@ -1,0 +1,7 @@
+path: .
+train: train
+val: val
+names:
+  - circle
+  - square
+  - triangle

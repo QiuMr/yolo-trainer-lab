@@ -1,0 +1,60 @@
+# ── 构建产物 ───────────────────────────────────────────────────────────────
+# artifacts/ 本机约 22 GB：编译中间产物、CDP 浏览器 profile、QA 截图、训练 runs。
+# 它全部可再生，且混着机器绝对路径，入库没有任何价值。
+artifacts/
+release/
+desktop/dist/
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+node_modules/
+dist/
+target/
+
+# Rust / Node 的锁文件要保留，否则别人 clone 下来构建不出同一个东西。
+# *.log 里是本机路径和临时调试输出，不入库。
+*.log
+
+# ── 外部二进制 ─────────────────────────────────────────────────────────────
+# montgomery.exe 是 externalBin，144 MB，来自 AGPL-3.0 上游仓库，不是本项目源码。
+# 构建/打包前必须放一个到 desktop/src-tauri/binaries/，获取方式见 README.md。
+desktop/src-tauri/binaries/*.exe
+
+# ── 上游源码（只作研究参考）────────────────────────────────────────────────
+# research/ 是 montgomery 与 Burn 的本地副本（57 MB），有自己的 LICENSE。
+# 随本仓库再分发一份既没有意义，也会让「哪个是本项目代码」变模糊。
+research/
+
+# ── 训练运行数据 ───────────────────────────────────────────────────────────
+# QA 夹具里的图片与 dataset.yaml 要入库（dataset.rs 的单元测试依赖它们），
+# 但训练跑出来的 runs/ 有上百 MB 的检查点，一律排除。
+spikes/**/runs/
+**/checkpoints/
+**/exports/
+*.bpk
+*.onnx
+
+# ── 签名私钥 ───────────────────────────────────────────────────────────────
+# 发版私钥放在用户目录（~/.tauri/），永远不进仓库。
+# 公钥以字符串形式写在 tauri.conf.json 的 plugins.updater.pubkey，本身不保密。
+*.key
+*.key.pub
+.env
+.env.*
+
+# ── 编辑器 / 系统 ──────────────────────────────────────────────────────────
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ── WorkBuddy ──────────────────────────────────────────────────────────────
+# memory/ 是项目决策与工作日志，属于文档，保留；其余本地状态排除。
+.workbuddy/*
+!.workbuddy/memory/

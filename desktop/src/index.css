@@ -1,0 +1,320 @@
+@import "tailwindcss";
+/* Local Inter + Noto Sans SC. Kept as an @import so every page gets the same faces and the
+   browser can still fetch only the unicode-range subsets it needs. */
+@import "./fonts.css";
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Design tokens.
+
+   The brief: white-dominant, black as the only accent, heavy type, one radius.
+   Anything that needs a second colour is a status, not a decoration.
+   ───────────────────────────────────────────────────────────────────────────── */
+@theme {
+  --font-sans:
+    "Inter", "Noto Sans SC", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+
+  /* Surfaces: white first, grey only to separate, never to decorate. */
+  --color-canvas: #ffffff;
+  --color-surface: #fafafa;
+  --color-surface-sunken: #f4f4f5;
+  --color-line: #e8e8ea;
+  --color-line-strong: #d4d4d8;
+
+  /* Ink: near-black rather than pure black — pure black on pure white vibrates. */
+  --color-ink: #0a0a0a;
+  --color-ink-soft: #52525b;
+  /* Was #a1a1aa: at 11–12px that is ~2.3:1 on white and genuinely hard to read. 71717a is 4.8:1,
+     which is what "faint" should mean — quieter than the body, still legible. */
+  --color-ink-faint: #71717a;
+
+  /* Status. Used only for state, never for emphasis. */
+  --color-ok: #15803d;
+  --color-warn: #b45309;
+  --color-danger: #b91c1c;
+
+  /* One radius family. Cards 14, controls 10, chips 8. */
+  --radius-card: 14px;
+  --radius-control: 10px;
+  --radius-chip: 8px;
+
+  /* ── Motion ────────────────────────────────────────────────────────────────
+     Three durations only: 120 (state change on a control), 180 (a panel moving),
+     280 (content entering). One easing — a steep-out curve that lands softly.
+     Anything longer than 300ms feels broken when you click it forty times an hour.
+
+     `--ease-spring` is the exception, and only for things that travel: the nav pill and
+     the sidebar edge. Overshooting by ~4% is what makes a moving object read as an object
+     rather than a cross-fade. Never use it on colour or opacity — overshoot has no meaning
+     there and just looks like a stutter. */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-spring: cubic-bezier(0.32, 1.36, 0.5, 1);
+
+  --animate-page-in: page-in 280ms var(--ease-out-soft) both;
+  /* Direction-aware transitions. Forward means "deeper into the app" — the new page enters
+     from the right, matching the direction the eye already travelled down the nav list. */
+  --animate-page-in-right: page-in-right 300ms var(--ease-out-soft) both;
+  --animate-page-in-left: page-in-left 300ms var(--ease-out-soft) both;
+  --animate-nav-in: nav-in 240ms var(--ease-out-soft) both;
+  --animate-card-in: card-in 280ms var(--ease-out-soft) both;
+  --animate-pop-in: pop-in 180ms var(--ease-out-soft) both;
+  --animate-fade-in: fade-in 160ms linear both;
+  --animate-log-in: log-in 180ms var(--ease-out-soft) both;
+  --animate-pulse-dot: pulse-dot 1800ms cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  --animate-toast-in: toast-in 220ms var(--ease-spring) both;
+
+  @keyframes page-in {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes page-in-right {
+    from {
+      opacity: 0;
+      transform: translate3d(22px, 6px, 0);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes page-in-left {
+    from {
+      opacity: 0;
+      transform: translate3d(-22px, 6px, 0);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes nav-in {
+    from {
+      opacity: 0;
+      transform: translateX(-6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes card-in {
+    from {
+      opacity: 0;
+      transform: translateY(10px) scale(0.995);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes pop-in {
+    from {
+      opacity: 0;
+      transform: translateY(-10px) scale(0.99);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes log-in {
+    from {
+      opacity: 0;
+      transform: translateX(-5px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  /* The running dot. Two rings expanding out of a solid core, staggered — a single
+     scaling dot reads as a loading spinner, which is the opposite of the message. */
+  @keyframes pulse-dot {
+    0% {
+      box-shadow:
+        0 0 0 0 rgb(21 128 61 / 0.35),
+        0 0 0 0 rgb(21 128 61 / 0.2);
+    }
+    70% {
+      box-shadow:
+        0 0 0 6px rgb(21 128 61 / 0),
+        0 0 0 11px rgb(21 128 61 / 0);
+    }
+    100% {
+      box-shadow:
+        0 0 0 0 rgb(21 128 61 / 0),
+        0 0 0 0 rgb(21 128 61 / 0);
+    }
+  }
+
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translateY(14px) scale(0.97);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-weight: 500;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    /* A desktop app should not rubber-band or select chrome by accident. */
+    overscroll-behavior: none;
+  }
+
+  /* Heavy by default: headings lean on weight, not size, for hierarchy. */
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin: 0;
+  }
+
+  ::selection {
+    background: var(--color-ink);
+    color: var(--color-canvas);
+  }
+
+  /* Slim, unobtrusive scrollbars — the default Windows ones break the white. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-strong) transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: var(--color-line-strong);
+    border-radius: 999px;
+    border: 3px solid var(--color-canvas);
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: var(--color-ink-faint);
+  }
+
+  /* Native controls inherit the type system instead of fighting it. */
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 2px;
+  }
+}
+
+@layer utilities {
+  /* Numbers in tables and metrics must not jitter as they change. */
+  .tnum {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+
+  /* Two interaction gestures, used everywhere instead of ad-hoc hovers.
+
+     `lift` is for surfaces you can pick up (cards, tiles): 1px up plus a shadow that is
+     almost invisible on white but gives the edge something to detach from. The press
+     collapses back to zero so the card never floats while you are clicking it.
+
+     `press` is for controls that do not move: a 1.5% squash, which is enough to feel
+     without making a 44px button visibly wobble. */
+  .lift {
+    transition:
+      transform 180ms var(--ease-out-soft),
+      box-shadow 180ms var(--ease-out-soft),
+      border-color 120ms linear,
+      background-color 120ms linear;
+  }
+  .lift:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 8px 20px -14px rgb(10 10 10 / 0.45);
+  }
+  .lift:active {
+    transform: translateY(0) scale(0.994);
+    box-shadow: none;
+  }
+
+  .press {
+    transition: transform 120ms var(--ease-out-soft);
+  }
+  .press:active {
+    transform: scale(0.985);
+  }
+
+  /* Horizontal drag affordance for the scrub fields. The cursor is the only signal that a
+     number can be dragged, so it has to be right on the whole field, not just the handle. */
+  .scrub {
+    cursor: ew-resize;
+    touch-action: none;
+  }
+  .scrub-active {
+    cursor: ew-resize;
+    user-select: none;
+  }
+
+  /* Content that must not be picked up by the window drag region or a text selection. */
+  .chrome {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+}
+
+/* Motion is decoration: if the OS asks for less, drop all of it. This also neutralises the
+   animated sidebar width, which is the one transition that can actually nauseate. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}

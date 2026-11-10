@@ -1,0 +1,345 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+/**
+ * Engine bridge.
+ *
+ * Everything the UI knows about training comes through here, and every field is defined by
+ * docs/API.md — the engine's contract, not a shape invented on this side. In a plain browser
+ * (design preview without the Tauri runtime) the functions fall back to sample data so the layout
+ * stays inspectable.
+ */
+
+export const isTauri =
+  typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+/** Layouts the scanner understands. COCO exists in the engine but not here — see dataset.rs. */
+export type DatasetFormat = "yolo" | "imagenet-folders";
+
+export type DatasetSummary = {
+  /** Data root the splits resolve against (`path:` in the yaml, or the yaml's own folder). */
+  root: string;
+  /** Absolute path of the `dataset.yaml`. Training needs this, not `root`: when `path:` points
+   *  somewhere else, there is no yaml at the data root. */
+  manifest: string;
+  classes: string[];
+  train_images: number;
+  val_images: number;
+  missing_labels: number;
+  annotated: number;
+  /** Per-class training image count, only for classification (empty for YOLO). */
+  class_counts: number[];
+  format: DatasetFormat;
+  warning: string | null;
+};
+
+export type TrainRequest = {
+  architecture: string;
+  dataset: string;
+  epochs: number;
+  batch: number;
+  imgsz: number | null;
+  device: string;
+};
+
+/** Events forwarded from the engine's stdout, plus `exit` which the shell adds. */
+export type EngineEvent =
+  | {
+      type: "start";
+      run: string;
+      backend: string;
+      adapter: string;
+      epochs: number;
+      batch_size: number;
+      image_size: number | null;
+      class_names: string[];
+    }
+  | {
+      type: "epoch";
+      epoch: number;
+      epochs: number;
+      loss: number;
+      fitness: number | null;
+      elapsed_s: number;
+    }
+  | { type: "end"; run: string; best: string | null; last: string | null }
+  | { type: "error"; code: string; message: string; hint: string | null }
+  | { type: "exit"; code: number | null };
+
+/** Settings as stored. Mirrors `settings::Settings` on the Rust side. */
+export type Settings = {
+  engine_path: string | null;
+  default_device: string;
+  output_dir: string | null;
+  /** Local HTTP control service for AI clients. Mirrors `settings::Settings`. */
+  control_enabled: boolean;
+  /** `0` asks the OS for a free port; the actual one comes back in `SettingsView.control`. */
+  control_port: number;
+};
+
+/**
+ * Live state of the control service. Mirrors `runtime::ControlInfo`.
+ *
+ * `port` is the port it actually got, which is not necessarily `control_port` in settings: if the
+ * requested one is taken the service falls back to an OS-assigned port rather than failing.
+ */
+export type ControlInfo = {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  token: string;
+  base_url: string;
+  error: string | null;
+};
+
+/**
+ * Settings as rendered. The shell resolves the paths; the UI never guesses where things live.
+ * Mirrors `SettingsView` in src-tauri/src/lib.rs.
+ *
+ * Written out rather than intersected with [`Settings`] because the two disagree on purpose:
+ * a stored `output_dir` of `null` means "use the default", while the view always carries a
+ * usable absolute path.
+ */
+export type SettingsView = {
+  engine_path: string | null;
+  default_device: string;
+  engine_resolved: string | null;
+  engine_error: string | null;
+  /** Always absolute, ready to display. */
+  output_dir: string;
+  output_dir_is_default: boolean;
+  config_dir: string;
+  engine_running: boolean;
+  control: ControlInfo;
+};
+
+const SAMPLE_SETTINGS: SettingsView = {
+  engine_path: null,
+  engine_resolved: "E:\\工作区\\yolo-trainer-lab\\artifacts\\target-dist\\release\\montgomery.exe",
+  engine_error: null,
+  default_device: "auto",
+  output_dir: "C:\\Users\\you\\AppData\\Roaming\\com.yolotrainer.desktop\\runs",
+  output_dir_is_default: true,
+  config_dir: "C:\\Users\\you\\AppData\\Roaming\\com.yolotrainer.desktop",
+  engine_running: false,
+  control: {
+    enabled: true,
+    running: true,
+    port: 47821,
+    token: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+    base_url: "http://127.0.0.1:47821",
+    error: null,
+  },
+};
+
+const SAMPLE_DATASET: DatasetSummary = {
+  root: "E:\\工作区\\yolo-trainer-lab\\spikes\\tiny-dataset",
+  manifest: "E:\\工作区\\yolo-trainer-lab\\spikes\\tiny-dataset\\dataset.yaml",
+  classes: ["dog", "person", "bike"],
+  train_images: 4,
+  val_images: 2,
+  missing_labels: 0,
+  annotated: 4,
+  class_counts: [],
+  format: "yolo",
+  warning: null,
+};
+
+const SAMPLE_CLASSIFY_DATASET: DatasetSummary = {
+  root: "E:\\工作区\\yolo-trainer-lab\\spikes\\tiny-classify",
+  manifest: "E:\\工作区\\yolo-trainer-lab\\spikes\\tiny-classify\\dataset.yaml",
+  classes: ["circle", "square", "triangle"],
+  train_images: 18,
+  val_images: 6,
+  missing_labels: 0,
+  annotated: 18,
+  class_counts: [6, 6, 6],
+  format: "imagenet-folders",
+  warning: null,
+};
+
+export async function resolveEngine(): Promise<string | null> {
+  if (!isTauri) return null;
+  try {
+    return await invoke<string>("resolve_engine");
+  } catch {
+    return null;
+  }
+}
+
+export async function pickDatasetFolder(): Promise<string | null> {
+  if (!isTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "选择数据集目录",
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+/** One image, for the post-training check. */
+export async function pickImageFile(): Promise<string | null> {
+  if (!isTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    directory: false,
+    multiple: false,
+    title: "选择一张图片",
+    filters: [{ name: "图片", extensions: ["jpg", "jpeg", "png", "webp"] }],
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+/** Mirrors `predict.rs`. `output` is absent for classification, which renders no image. */
+export type PredictResult = {
+  model: string;
+  source: string;
+  output: string | null;
+  prediction: Record<string, unknown>;
+};
+
+export type PredictRequest = {
+  /** Omitted means "the best model from the last run". */
+  model?: string | null;
+  source: string;
+  output?: string | null;
+  confidence?: number | null;
+  masks?: boolean;
+};
+
+/** Plausible output for the browser preview, so the inference card can be reviewed without a
+ *  shell around it. Never reaches the real app: `predictImage` returns this only when `!isTauri`. */
+const SAMPLE_PREDICTION: PredictResult = {
+  model: "…\\runs\\2026-11-10-19-20\\exports\\best.bpk",
+  source: "…\\tiny-dataset\\images\\val\\img1.jpg",
+  output: null,
+  prediction: {
+    task: "detection",
+    coordinate_format: "xyxy",
+    detections: [
+      { class_name: "person", confidence: 0.86, xmin: 120, ymin: 40, xmax: 260, ymax: 300 },
+      { class_name: "dog", confidence: 0.71, xmin: 300, ymin: 90, xmax: 430, ymax: 280 },
+      { class_name: "bike", confidence: 0.54, xmin: 40, ymin: 210, xmax: 190, ymax: 330 },
+    ],
+  },
+};
+
+export async function predictImage(
+  request: PredictRequest,
+): Promise<PredictResult> {
+  if (!isTauri) return { ...SAMPLE_PREDICTION, source: request.source };
+  return await invoke<PredictResult>("predict_image", { request });
+}
+
+export async function scanDataset(path: string): Promise<DatasetSummary> {
+  if (!isTauri) {
+    // Preview mode: return a sample so the page can be judged without an engine. The path picks
+    // which layout to stand in for — the two render different cards.
+    const sample = path.includes("classify")
+      ? SAMPLE_CLASSIFY_DATASET
+      : SAMPLE_DATASET;
+    return { ...sample, root: path || sample.root, manifest: path ? `${path}\\dataset.yaml` : sample.manifest };
+  }
+  return await invoke<DatasetSummary>("scan_dataset", { path });
+}
+
+export async function getSettings(): Promise<SettingsView> {
+  if (!isTauri) return SAMPLE_SETTINGS;
+  return await invoke<SettingsView>("get_settings");
+}
+
+/** Returns the stored settings as the shell sees them, so the UI can show what actually landed. */
+export async function saveSettings(
+  settings: Settings,
+): Promise<SettingsView> {
+  if (!isTauri) {
+    // Preview: echo the edit back without pretending to know the shell's resolved paths.
+    return {
+      ...SAMPLE_SETTINGS,
+      engine_path: settings.engine_path,
+      default_device: settings.default_device,
+      output_dir: settings.output_dir ?? SAMPLE_SETTINGS.output_dir,
+      output_dir_is_default: settings.output_dir === null,
+      // Preview has no listener, so the toggle only has to change what is rendered.
+      control: { ...SAMPLE_SETTINGS.control, enabled: settings.control_enabled },
+    };
+  }
+  return await invoke<SettingsView>("save_settings", { settings });
+}
+
+/** Pick a folder for a given purpose; the dialog title is the only difference between callers. */
+export async function pickFolder(title: string): Promise<string | null> {
+  if (!isTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({ directory: true, multiple: false, title });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function pickEngineFile(): Promise<string | null> {
+  if (!isTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    multiple: false,
+    title: "选择 montgomery 引擎",
+    filters: [{ name: "可执行文件", extensions: ["exe"] }],
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function startTraining(request: TrainRequest): Promise<void> {
+  if (!isTauri) {
+    throw new Error("当前是界面预览模式，未连接训练引擎。");
+  }
+  await invoke("start_training", { request });
+}
+
+export async function stopTraining(): Promise<void> {
+  if (!isTauri) return;
+  await invoke("stop_training");
+}
+
+export async function onEngineEvent(
+  handler: (event: EngineEvent) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri) return () => {};
+  return await listen<EngineEvent>("engine-event", (payload) =>
+    handler(payload.payload),
+  );
+}
+
+export async function onEngineLog(
+  handler: (line: string) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri) return () => {};
+  return await listen<{ line: string }>("engine-log", (payload) =>
+    handler(payload.payload.line),
+  );
+}
+
+/** Human-readable summary of an error code, per docs/API.md. */
+export const ERROR_COPY: Record<string, { title: string; action: string }> = {
+  GPU_LOST: {
+    title: "显卡设备丢失",
+    action: "更新显卡驱动，或改用 CPU 重新训练。",
+  },
+  GPU_FALLBACK: {
+    title: "已回退到 CPU",
+    action: "显卡不可用，训练会慢一些，但仍然可以进行。",
+  },
+  NO_DATASET: {
+    title: "数据集有问题",
+    action: "检查 dataset.yaml 的路径与划分。",
+  },
+  BAD_ANNOTATION: {
+    title: "标注格式错误",
+    action: "每行应为：类别 中心x 中心y 宽 高（0~1）。",
+  },
+  EMPTY_DATASET: { title: "数据集是空的", action: "检查 train 目录里是否有图片。" },
+  CLASS_MISMATCH: {
+    title: "类别对不上",
+    action: "续训要求类别与原数据集一致。",
+  },
+  OOM: { title: "显存不足", action: "调小 batch 或分辨率后重试。" },
+  INTERNAL: { title: "引擎报错", action: "查看下方日志里的详细原因。" },
+};

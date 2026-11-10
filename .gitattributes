@@ -1,0 +1,21 @@
+# 源码统一 LF，避免 Windows 上 checkout 出 CRLF 造成整文件 diff。
+* text=auto eol=lf
+
+# PowerShell 5.1 对无 BOM + LF 的 .ps1 会按 GBK 解码，中文注释直接撕裂。
+# 发版脚本本身写的是 UTF-8 BOM + CRLF，这里保证 clone 后仍是 CRLF。
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# 二进制不要被当文本处理（字体、图标、测试图片、引擎二进制）。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.woff2 binary
+*.exe binary
+*.dll binary
+*.bpk binary
+*.onnx binary

@@ -1,0 +1,3 @@
+{"type":"start","run":"runs\\detect\\train-1794284121-000021d4","backend":"cpu","adapter":"Device<Flex(Cpu)>","epochs":2,"batch_size":2,"image_size":320,"class_names":["dog","person","bike"]}
+{"type":"epoch","epoch":1,"epochs":2,"loss":4573.58154296875,"fitness":null,"elapsed_s":1.1945371}
+{"type":"epoch","epoch":2,"epochs":2,"loss":4072.841796875,"fitness":null,"elapsed_s":1.3204187}
