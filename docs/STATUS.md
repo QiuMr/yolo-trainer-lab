@@ -26,6 +26,10 @@
 | 带签名 `npx tauri build` | ✅ 5m35s；`setup.exe` 29.07 MiB + `.exe.sig` 444 B |
 | `scripts/release.ps1` | ✅ UTF-8 BOM + CRLF，PowerShell 解析 0 错误 |
 | 版本号 | `build.rs` 从 `tauri.conf.json` 注入 `YOLO_TRAINER_VERSION`，三段数字断言 |
+| GitHub Releases | `v0.1.0` / `0.1.1` / `0.1.2` / `0.1.3`，`releases/latest/download/latest.json` 匿名可读 |
+| `spikes/qa/probe_update.py` | ✅ 12/12（无 BOM、字段齐全、签名 `version:` 与 feed 一致、安装包资产可下载） |
+| 真实客户端检查更新 | ✅ v0.1.1 客户端显示「发现新版本 v0.1.2」+ notes + 可升级徽标；下载进度条正常 |
+| 升级对照实验 | `/P /UPDATE /R /ARGS` 未落地；`/S /UPDATE /R /ARGS` 成功：注册表 `0.1.1→0.1.2`、exe 时间戳更新、`/R` 自动重启 → D024 改用 `quiet` |
 
 **发版实测，三个与预期不符的地方**（D023）：
 
@@ -37,7 +41,9 @@
 3. 签名 trusted comment **带 `version:`**（初次只看前 300 字符误判成不带）。据此启用
    `requireSignedVersion`，堵住用旧签名强制降级的攻击。
 
-**仍未验证**：真实跨版本升级（v0.1.1 发布后用旧版客户端演练）；独显机器上的 GPU 训练。
+**仍未验证 / 需人工**：在**正常交互式桌面**完整点一次「下载并安装」，确认安装器自动装完并
+重启（agent 会话里 passive 弹窗无法完成；quiet 的等价参数已手动验证成功，见 D024）；
+独显机器上的 GPU 训练。
 
 ## 关键体积
 
@@ -224,7 +230,7 @@ let time_measurement = if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
 - [ ] 训练产物精度验证需要真实数据集（当前 tiny-dataset 仅验证流程）
 - [ ] 决定是否把 `MONTGOMERY_WGPU_BACKEND` / `CUBECL_WGPU_TIMING` 保留为正式功能
 - [ ] 明确桌面壳的开源许可证：README 已写清"公开可见但未指定许可"，对外分发前要定
-- [ ] 真实跨版本升级演练：用旧版点「下载并安装」升到新版（需要第二个 Release）
+- [ ] 在正常交互式桌面人工点一次「下载并安装」，确认自动装完 + 重启（D024；agent 会话只验证到「拉起安装器」）
 - [x] `requireSignedVersion`——已启用：CLI 2.12.4 的签名确实带 `version:`（D023）
 - [ ] 人工过一遍拖文件夹进窗口的手势、托盘菜单
 - [x] 本地控制服务（AI 操控）——已完成

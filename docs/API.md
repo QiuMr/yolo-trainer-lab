@@ -490,9 +490,13 @@ Release 资产共两个：上传副本与 `latest.json`。**必须用无空格�
 | 版本相同或更旧 | `has_update = false`，界面显示"已是最新版本" |
 | feed 版本号比当前旧但插件仍返回更新 | `install_update` 显式拒绝，报"更新源指向 v… 已中止" |
 | 签名不匹配 | 下载阶段报错，安装包**不会运行**（插件先验签再 `install`） |
-| 安装成功 | Windows 上进程退出 → NSIS `/P` 静默安装 → `/R` 自动重启 |
+| 安装成功 | Windows 上进程退出 → NSIS `/S` 完全静默安装 → `/R` 自动重启 |
 
 私钥在 `%USERPROFILE%\.tauri\yolo-trainer.key`，不入库。`requireSignedVersion` **已启用**：
 CLI 2.12.4 的签名 trusted comment 是 `timestamp:…\tfile:…\tversion:<ver>`，**带版本**；
 启用后不带版本字段的签名一律拒绝，防止拿旧签名配虚高版本号强制降级。若存量 Release
 由更老的 CLI 签过（不带 version），必须重签重发才能被新客户端接受（D023）。
+
+`plugins.updater.windows.installMode` 用 **`quiet`**（NSIS `/S`），不是官方默认的 `passive`
+（`/P`）：实测 passive 的进度窗口在非交互 / 受 UIPI 约束的会话里无法完成，安装器退出却没
+落地；quiet 用同一组参数 `/S /UPDATE /R /ARGS` 成功升级并自动重启（D024）。

@@ -207,6 +207,7 @@ scripts/release.ps1                    GitHub Release
 | feed URL / 公钥 | `tauri.conf.json` 的 `plugins.updater` | 一次写定，发版不改客户端 |
 | 版本号 | `tauri.conf.json` | `build.rs` 注入 Rust，CLI 命名安装包，脚本打 tag（D022） |
 | 签名私钥 | `%USERPROFILE%\.tauri\`，**不入库** | 泄漏等于任何人能发"通过校验"的假更新（D023） |
+| 安装模式 | `plugins.updater.windows.installMode = quiet` | NSIS `/S` 完全静默；`passive`（`/P`）的进度窗口在受限会话里无法完成（D024） |
 | 发版脚本 | `scripts/release.ps1` | 校验工作区/tag/产物 → 构建 → push → 建 Release → **核对资产并补传** |
 | 客户端 | `updater.rs` + `UpdateCard.tsx` | 检查、进度、安装；失败一律收敛成可读句子 |
 

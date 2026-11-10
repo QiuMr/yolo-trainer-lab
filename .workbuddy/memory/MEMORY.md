@@ -59,4 +59,7 @@
 - 自动更新用 **tauri-plugin-updater + NSIS 安装器**（不照搬 OCR-Studio 的 zip 覆盖：注册表、
   卸载项、externalBin 占用三者都不允许）。GitHub 仓库必须 **public**，否则客户端匿名下载不到
   Release 资产（D020/D021）。
-- 发版一律走 `scripts/release.ps1`，不手工改版本号、不手工传资产。
+- 发版一律走 `scripts/release.ps1`，不手工改版本号、不手工传资产；发完先跑
+  `python spikes/qa/probe_update.py`（12 项断言）。
+- 更新安装模式用 **`quiet`**（NSIS `/S`）：实测 `passive`（`/P`）的进度窗口在非交互/UIPI
+  受限会话里无法完成，表现为"点了更新程序关了没起来"（D024）。
