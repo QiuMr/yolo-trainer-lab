@@ -151,7 +151,8 @@ export default function UpdateCard() {
       <div className="flex items-center justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
           <span className="shrink-0 rounded-[8px] bg-surface-sunken px-2.5 py-1 font-mono text-[12px] font-bold tracking-tight">
-            v{version ?? "…"}
+            {/* Browser preview has no version number; prefixing it with "v" would read as a lie. */}
+            {version && /^\d/.test(version) ? `v${version}` : (version ?? "…")}
           </span>
           <span
             className={cx(
