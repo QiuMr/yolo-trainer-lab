@@ -61,6 +61,7 @@ GPU 驱动出问题只会杀掉引擎进程，壳活着并可以提示或重试�
 | `lib/demo.ts` | 浏览器预览用的假训练数据（`?demo=1`），保证监控页无引擎也能审阅 |
 | `lib/models.ts` | 模型目录：7 个家族 × 3 个任务 × 规模档，`architectureId()` 按引擎的 `ModelId` 规则拼 ID。**这是模型名字的唯一来源**，页面不允许再手写 `"yolo26n"` 字面量 |
 | `components/PredictCard.tsx` | 训练完成后用一张图验证产物：调 `predict_image`，左侧标注图、右侧检出列表 |
+| `components/UpdateCard.tsx` | 设置页「版本与更新」：挂载时静默检查 + 6 h 缓存、进度事件、一键下载安装；网络失败只显示浅色句子 |
 | `App.tsx` | 外壳：标题栏 + 侧边栏 + 页面区；全局事件订阅、手势与快捷键、页面方向转场都在这一层 |
 | `pages/DatasetPage.tsx` | 选目录 → 扫描 → 展示类别/图片数/标注覆盖率 → 下一步引导 |
 | `pages/TrainPage.tsx` | 任务/家族/规模三级选择模型 → 参数 → 启动训练 → 跳转监控 |
@@ -94,8 +95,9 @@ GPU 驱动出问题只会杀掉引擎进程，壳活着并可以提示或重试�
 
 ## 后端（`desktop/src-tauri/src/`）
 
-模块边界是刻意的：**只有 `lib.rs` 与 `tray.rs` 碰 Tauri**，其余全是纯逻辑，窗口与 HTTP 服务
-直接复用它们（DECISIONS D011）。
+模块边界是刻意的：**只有 `lib.rs`、`tray.rs` 与 `updater.rs` 碰 Tauri**，其余全是纯逻辑，
+窗口与 HTTP 服务直接复用它们（DECISIONS D011）。`updater.rs` 是例外：它必须拿 `AppHandle`
+才能发进度事件，且本身就是窗口专属能力。
 
 | 模块 | 职责 | 依赖 Tauri |
 | --- | --- | --- |
@@ -106,6 +108,8 @@ GPU 驱动出问题只会杀掉引擎进程，壳活着并可以提示或重试�
 | `runstate.rs` | 把 hub 事件折叠成一份快照（status/epoch/loss/产物/错误） | 否 |
 | `runtime.rs` | 两边共享的状态：设置、引擎句柄、快照、控制服务句柄 | 否 |
 | `control.rs` | 本地 HTTP 服务：路由、鉴权、自描述文档 | 否 |
+| `version.rs` | 版本号（`build.rs` 从 `tauri.conf.json` 注入）+ 数值化版本比较 | 否 |
+| `updater.rs` | 查 GitHub feed、下载验签、发进度事件、拉起 NSIS 安装器 | 是 |
 | `tray.rs` | 托盘图标、显示/隐藏、退出 | 是 |
 | `lib.rs` | `#[tauri::command]` 薄壳、hub 订阅线程、进程生命周期 | 是 |
 
@@ -118,6 +122,9 @@ GPU 驱动出问题只会杀掉引擎进程，壳活着并可以提示或重试�
 | `predict_image` | 调 `predict.rs`，用当前 `RunState.best` 或显式指定的 bpk 推理一张图 |
 | `get_settings` | 返回**已解析**的视图（引擎绝对路径、产物绝对路径、错误原因） |
 | `save_settings` | 归一化 → 落盘 → 更新内存缓存 → （控制参数变了就重启监听）→ 回显视图 |
+| `app_version` | 返回编译进去的版本号，由 `build.rs` 注入，前端不硬编码 |
+| `check_update` | 查 GitHub feed；**永远成功**，网络/解析失败收敛进 `UpdateInfo.error` |
+| `install_update` | 下载 → 验签 → NSIS `/P` 安装；Windows 上成功即退出进程 |
 
 `Runtime` 是所有状态的唯一归属：`engine` 句柄、当前设置、`RunState`、`control::Handle`。
 命令层只做「解参数 → 调方法 → 序列化结果」。这也是控制服务能直接复用同一套逻辑的原因——
@@ -174,7 +181,42 @@ desktop/src-tauri/binaries/montgomery-x86_64-pc-windows-msvc.exe   ← 源（构
 仓库相对路径 `artifacts/target-dist/release/montgomery.exe` 兜底。
 
 体积构成：引擎 137.4 MB + Tauri 壳约 10 MB（WebView2 复用系统自带，不计入）。
+NSIS 压缩后安装包约 29 MiB。
 
+---
+
+## 自动更新
+
+```
+scripts/release.ps1                    GitHub Release
+  ├─ 读 tauri.conf.json 的 version ─────▶ tag vX.Y.Z
+  ├─ npx tauri build（带私钥）          ├─ YOLO Trainer_X.Y.Z_x64-setup.exe
+  └─ release/latest.json ◀─────────────┴─ latest.json（含 .exe.sig 的内容）
+                                              │
+                          固定 URL：releases/latest/download/latest.json
+                                              │ 匿名 GET
+                                              ▼
+                                    updater.rs / tauri-plugin-updater
+                                      版本比较 → 下载 → minisign 验签
+                                              │
+                                      NSIS /P → /R 重启
+```
+
+| 层 | 归属 | 说明 |
+| --- | --- | --- |
+| feed URL / 公钥 | `tauri.conf.json` 的 `plugins.updater` | 一次写定，发版不改客户端 |
+| 版本号 | `tauri.conf.json` | `build.rs` 注入 Rust，CLI 命名安装包，脚本打 tag（D022） |
+| 签名私钥 | `%USERPROFILE%\.tauri\`，**不入库** | 泄漏等于任何人能发"通过校验"的假更新（D023） |
+| 发版脚本 | `scripts/release.ps1` | 校验工作区/tag/产物 → 构建 → push → 建 Release → **核对资产并补传** |
+| 客户端 | `updater.rs` + `UpdateCard.tsx` | 检查、进度、安装；失败一律收敛成可读句子 |
+
+**信任边界**：feed 走 HTTPS 但本身不签名，签名只覆盖下载的安装包。所以插件先验签再运行安装器，
+`install_update` 另做一次"远端版本必须比当前新"的显式判断，防止把旧 Release 的合法签名
+配上一个虚高的版本号实现降级。`requireSignedVersion` 暂未启用（CLI 2.12.4 的签名不带版本，
+见 D023）。
+
+**为什么不是 zip 覆盖**：NSIS 安装写注册表与卸载项，且 `externalBin` 与 WebView2 DLL 在主进程
+运行时被占用。详见 D020。
 
 ---
 

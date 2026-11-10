@@ -19,6 +19,7 @@ import {
   Zap,
 } from "lucide-react";
 import { Badge, Button, Card, SectionTitle, cx } from "../components/ui";
+import UpdateCard from "../components/UpdateCard";
 import {
   getSettings,
   pickEngineFile,
@@ -417,6 +418,10 @@ export default function SettingsPage({
           服务只绑定 127.0.0.1，外部网络连不上。
         </p>
       </Card>
+
+      {/* Last card: low-frequency, and it owns its own network state so the rest of the page
+          stays a pure renderer of `settings.json`. */}
+      <UpdateCard />
 
       {error ? (
         <div className="mt-4 flex items-start gap-3 rounded-[14px] border border-danger/25 bg-danger/5 px-5 py-4">

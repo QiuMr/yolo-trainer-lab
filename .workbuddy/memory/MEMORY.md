@@ -40,9 +40,20 @@
 - 推理一律走 `predict.rs`，它强制把标注图写到 `<输出目录>/predictions/`。引擎默认写在源图旁边，
   会污染数据集。
 
+- **版本号只有一个来源**：`desktop/src-tauri/tauri.conf.json` 的 `version`。`build.rs` 注入 Rust，
+  CLI 命名安装包，`scripts/release.ps1` 打 tag。不要用 `CARGO_PKG_VERSION`（读 Cargo.toml，会漂）。
+- **发版签名私钥**在 `%USERPROFILE%\.tauri\yolo-trainer.key`，不入库；公钥写在 `tauri.conf.json`。
+- **NSIS 更新产物是 `<setup>.exe` + `<setup>.exe.sig`，没有 `.nsis.zip`**；签名内容嵌进
+  `latest.json`，Release 只传 2 个资产。`.sig` 不带版本 → 别开 `requireSignedVersion`。
+- `scripts/*.ps1` 必须 UTF-8 BOM + CRLF（PowerShell 5.1 按 GBK 解无 BOM 文件）。
+
 ## 当前架构决策（详见 docs/DECISIONS.md）
 
 - 主引擎用 **montgomery**（AGPL-3.0，许可与体积用户已接受）。
 - **UI 通过子进程调用 montgomery.exe（sidecar），不静态链接** —— 保持 AGPL 隔离，UI 可闭源，且 GPU 崩溃不牵连 UI。
 - 前端：**Tauri 2 + React 19 + TypeScript + Vite**。
 - CPU 是**正式支持的降级路径**，不是临时调试手段。
+- 自动更新用 **tauri-plugin-updater + NSIS 安装器**（不照搬 OCR-Studio 的 zip 覆盖：注册表、
+  卸载项、externalBin 占用三者都不允许）。GitHub 仓库必须 **public**，否则客户端匿名下载不到
+  Release 资产（D020/D021）。
+- 发版一律走 `scripts/release.ps1`，不手工改版本号、不手工传资产。

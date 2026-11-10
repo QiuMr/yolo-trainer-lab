@@ -1,5 +1,59 @@
 # 变更记录
 
+## 2026-11-11 凌晨 · GitHub 仓库、版本管理与自动更新
+
+上一轮结束时项目还没有 Git 仓库，也没有任何发版/升级手段。这一轮把「代码在哪、版本从哪来、
+新版怎么到用户机器上」补齐。参考了 `D:\Python测试\OCR-Studio` 的发版流程，但**没有照搬它的
+更新机制**：那边是免安装 zip、更新等于覆盖目录；这边是 NSIS 安装包，覆盖法会留下错误的注册表
+与卸载项，且 `externalBin` 引擎在主进程运行时被占用。改用 Tauri 官方 updater（D020）。
+
+### 仓库与版本
+
+| 文件 | 变化 |
+| --- | --- |
+| `.gitignore` / `.gitattributes` | 排除 22 GB `artifacts/`、144 MB 引擎二进制、57 MB 上游源码、签名私钥；`.ps1` 固定 CRLF |
+| `desktop/src-tauri/build.rs` | 从 `tauri.conf.json` 读顶层 `version`，断言三段数字，注入 `YOLO_TRAINER_VERSION` |
+| `desktop/src-tauri/src/version.rs` | 新增：`VERSION` + 数值化 `cmp_version`（`"0.10.0" > "0.9.0"`，字典序会翻错） |
+| `README.md` | 新增：能力、构建前置、发版、许可与第三方组件、已知边界、文档索引 |
+
+**版本号只有一个来源**（D022）：`tauri.conf.json` → `build.rs` 注入 Rust / CLI 命名安装包 /
+`release.ps1` 打 tag。`CARGO_PKG_VERSION` 被明确否决，它读 `Cargo.toml`，正是会漂的第二份。
+漂了不会编译报错，只会让客户端永远显示"已是最新"。
+
+### 自动更新
+
+| 文件 | 变化 |
+| --- | --- |
+| `tauri.conf.json` | 新增 `plugins.updater`（公钥 + 固定 feed URL + `installMode: passive`）与 `bundle.createUpdaterArtifacts: true` |
+| `src-tauri/Cargo.toml` | 加 `tauri-plugin-updater = "2"`；顺手把模板化的 description/authors 换掉 |
+| `src-tauri/src/updater.rs` | 新增：`check()` 把一切失败收敛进 `UpdateInfo.error`；`install()` 验签后拉起安装器，发进度事件 |
+| `src-tauri/src/lib.rs` | 注册插件 + `app_version` / `check_update` / `install_update` 三个命令 |
+| `src/lib/api.ts` | 加 `UpdateInfo` / `UpdateProgress` 类型与四个封装，浏览器预览不伪造版本号 |
+| `src/components/UpdateCard.tsx` | 新增：设置页「版本与更新」，挂载静默检查 + 6 h 缓存（失败不缓存）+ 进度 + 一键安装 |
+| `scripts/release.ps1` | 新增：校验 → 构建 → 生成无 BOM `latest.json` → push/tag → Release → 核对资产并补传 |
+
+**实测发现的产物形态**：NSIS 下 `createUpdaterArtifacts: true` 产出 `<setup>.exe` + `<setup>.exe.sig`，
+**没有 `.nsis.zip`**。签名字符串嵌进 `latest.json`，Release 只需两个资产。脚本最初按 zip 写，
+看到真实产物后改的（D023）。
+
+`.sig` 的 trusted comment 只有 `timestamp` 与 `file`，**不带版本**，所以没有启用
+`requireSignedVersion`——启用会让当前所有包被客户端拒绝（D023）。
+
+### 实测
+
+- `cargo test --lib` **28 passed / 1 ignored**；`npx tsc --noEmit` 干净。
+- 带签名 `npx tauri build`：5m35s，`setup.exe` 29.07 MiB、`setup.exe.sig` 444 B。
+- `release.ps1`：UTF-8 BOM + CRLF，PowerShell 5.1 解析器 0 错误。
+- `gh repo create QiuMr/yolo-trainer-lab --public` 成功（D021：私有仓库的 Release 资产不能匿名下载，
+  自动更新会 404）。
+
+### 决策
+
+新增 D020（官方 updater vs 自研覆盖）、D021（仓库必须 public）、D022（版本号单一来源）、
+D023（私钥不入库 + 暂不启用 requireSignedVersion）。
+
+---
+
 ## 2026-11-11 凌晨 · 分类链路打通 + 单图推理
 
 上一轮把 63 个模型放进了选择器，分类那 15 个是灰的：扫描器只认 YOLO 的 `images/ + labels/`，

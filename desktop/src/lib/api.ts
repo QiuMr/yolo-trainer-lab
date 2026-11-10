@@ -317,6 +317,66 @@ export async function onEngineLog(
   );
 }
 
+/* ── Automatic updates ────────────────────────────────────────────────────────
+   The feed lives at GitHub Releases; the Rust side owns the URL, the signature check and the
+   installer. The UI only ever sees a small `UpdateInfo` — no URLs, no signatures, no raw JSON.
+   ───────────────────────────────────────────────────────────────────────────── */
+
+export type UpdateInfo = {
+  current: string;
+  /** Equals `current` when there is nothing to install, so the chip is never blank. */
+  latest: string;
+  has_update: boolean;
+  notes: string;
+  /** A filled string means "could not check" — distinct from "no update". */
+  error: string | null;
+};
+
+export type UpdateProgress = {
+  phase: "downloading" | "installing";
+  /** `-1` when the server did not send Content-Length. */
+  percent: number;
+};
+
+/** Browser preview has no installed binary, so there is deliberately no fake version number. */
+export async function getAppVersion(): Promise<string> {
+  if (!isTauri) return "预览模式";
+  return await invoke<string>("app_version");
+}
+
+export async function checkUpdate(): Promise<UpdateInfo> {
+  if (!isTauri) {
+    return {
+      current: "预览模式",
+      latest: "预览模式",
+      has_update: false,
+      notes: "",
+      error: "浏览器预览没有 Tauri 运行时，更新检查不可用。",
+    };
+  }
+  return await invoke<UpdateInfo>("check_update");
+}
+
+/**
+ * On Windows a successful install **exits the process**, so this promise normally never
+ * settles. Callers must treat the `installing` progress event as the terminal state.
+ */
+export async function installUpdate(): Promise<void> {
+  if (!isTauri) throw new Error("预览模式无法安装更新。");
+  await invoke<void>("install_update");
+}
+
+export async function onUpdateProgress(
+  handler: (progress: UpdateProgress) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri) return () => {};
+  // Must match `updater::PROGRESS_EVENT` in src-tauri/src/updater.rs. It is a plain string
+  // because there is no shared constant across the IPC boundary; docs/API.md is the contract.
+  return await listen<UpdateProgress>("update-progress", (payload) =>
+    handler(payload.payload),
+  );
+}
+
 /** Human-readable summary of an error code, per docs/API.md. */
 export const ERROR_COPY: Record<string, { title: string; action: string }> = {
   GPU_LOST: {

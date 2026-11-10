@@ -35,9 +35,31 @@ mod runstate;
 mod runtime;
 mod settings;
 mod tray;
+mod updater;
+mod version;
 
 use engine::TrainRequest;
 use runtime::{Runtime, SettingsView};
+
+/// The version the settings page displays. Kept as a command rather than a build-time constant in
+/// the frontend so a browser preview can never disagree with the installed binary.
+#[tauri::command]
+fn app_version() -> String {
+    version::VERSION.to_owned()
+}
+
+/// Async so the HTTP request never blocks a command thread. `updater::check` folds all network
+/// failures into the returned struct; the command itself always succeeds.
+#[tauri::command]
+async fn check_update(app: tauri::AppHandle) -> updater::UpdateInfo {
+    updater::check(&app).await
+}
+
+/// On Windows this does not return on success: the updater launches the NSIS installer and exits.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    updater::install(&app).await
+}
 
 #[tauri::command]
 fn resolve_engine(runtime: State<'_, Runtime>) -> Result<String, String> {
@@ -113,6 +135,8 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Reads `plugins.updater` from tauri.conf.json (feed URL + minisign public key).
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(
             // POSITION | SIZE | MAXIMIZED, deliberately without VISIBLE: the app closes to
             // the tray, so the last-launched state can be "hidden". Restoring that would
@@ -132,7 +156,10 @@ pub fn run() {
             stop_training,
             predict_image,
             get_settings,
-            save_settings
+            save_settings,
+            app_version,
+            check_update,
+            install_update
         ])
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;

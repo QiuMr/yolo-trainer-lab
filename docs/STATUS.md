@@ -1,9 +1,10 @@
-# 项目状态（2026-11-10）
+# 项目状态（2026-11-11）
 
 ## 一句话结论
 
 **montgomery 的完整链路可用**：数据 → 训练 → 导出 `.bpk` → 推理，全部在本机跑通（CPU 后端）。
-GPU 后端在这台机器上不可靠，需换独显机器验证。AGPL 与体积已确认可接受。
+桌面壳、AI 操控接口、63 个模型选择器、分类链路、单图推理都已闭环；本轮补上 GitHub 仓库、
+版本管理与自动更新。GPU 后端在这台机器上不可靠，需换独显机器验证。
 
 ## 已实测通过
 
@@ -14,6 +15,24 @@ GPU 后端在这台机器上不可靠，需换独显机器验证。AGPL 与体�
 | 训练干跑（CPU） | `train --dry-run` | ✅ `Device<Flex(Cpu)>`，forward/loss/backward 全过 |
 | 训练 1 epoch（CPU） | `train --epochs 1 --no-val` | ✅ `loss 4573.58`，产出 checkpoints + exports |
 | 训练产物推理 | `predict --model exports/best.bpk` | ✅ 正常输出检测结果、写出标注图 |
+
+## 本轮新增：GitHub 仓库与自动更新（2026-11-11）
+
+| 项目 | 实测结果 |
+| --- | --- |
+| 仓库 | `QiuMr/yolo-trainer-lab`（**public**，D021）；首次提交 472 文件 / 11.63 MiB，22 GB 构建产物与上游源码全部排除 |
+| `cargo test --lib` | ✅ 28 passed / 1 ignored（新增 `version` 3 + `updater` 3） |
+| `npx tsc --noEmit` | ✅ 干净 |
+| 带签名 `npx tauri build` | ✅ 5m35s；`setup.exe` 29.07 MiB + `.exe.sig` 444 B |
+| `scripts/release.ps1` | ✅ UTF-8 BOM + CRLF，PowerShell 解析 0 错误 |
+| 版本号 | `build.rs` 从 `tauri.conf.json` 注入 `YOLO_TRAINER_VERSION`，三段数字断言 |
+
+**产物形态（实测，与直觉不同）**：NSIS 目标下 `createUpdaterArtifacts: true` 产出的是
+`<setup>.exe` + `<setup>.exe.sig`，**没有 `.nsis.zip`**。签名内容嵌进 `latest.json`，Release 只传
+安装包与 `latest.json` 两个资产。发版脚本最初按 zip 写，是看了实际产物后改的（D023）。
+
+**仍未验证**：真实跨版本升级（需要第二个 Release）；`requireSignedVersion`（CLI 2.12.4 的
+签名 trusted comment 不带版本，启用会拒掉现有包）。
 
 ## 关键体积
 
@@ -199,12 +218,15 @@ let time_measurement = if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
 - [ ] 确认 `--batch -1` 自动批大小在本机外的行为
 - [ ] 训练产物精度验证需要真实数据集（当前 tiny-dataset 仅验证流程）
 - [ ] 决定是否把 `MONTGOMERY_WGPU_BACKEND` / `CUBECL_WGPU_TIMING` 保留为正式功能
-- [ ] AGPL-3.0 的合规措辞（若对外分发二进制）
-- [ ] 人工过一遍拖文件夹进窗口的手势
+- [ ] 明确桌面壳的开源许可证：README 已写清"公开可见但未指定许可"，对外分发前要定
+- [ ] 真实跨版本升级演练：用旧版点「下载并安装」升到新版（需要第二个 Release）
+- [ ] `requireSignedVersion`：等 Tauri CLI 在签名里写版本号，并重签所有存量 Release 后再开（D023）
+- [ ] 人工过一遍拖文件夹进窗口的手势、托盘菜单
 - [x] 本地控制服务（AI 操控）——已完成
 - [x] 模型选择器（63 个全开放）——已完成
 - [x] 分类数据集链路（ImageNet 目录结构）——已完成
 - [x] `/predict` 单图推理端点 + 界面验证卡片——已完成
+- [x] GitHub 公开仓库 + 版本管理 + 官方 updater + 发版脚本——已完成
 - [ ] COCO 数据集：引擎能读，扫描器不会，UI 现在明确拒绝。要接得解析 COCO JSON（含 RLE mask）
 - [ ] 分割 / 检测共用标签文件，扫描器无法区分 bbox 与多边形；如需提前拦截要解析标签内容
 - [ ] `GET /watch` 长轮询：只在需要"训练崩了立刻知道"时才做（D019）
@@ -243,4 +265,18 @@ python spikes/qa/shot_model_picker.py 5200 # 模型选择器的 8 组联动断�
 /d/Git/usr/bin/rm.exe -rf desktop/dist        # vite 清目录会被 safe-delete 阈值拦住
 cd desktop && npx tauri build                 # 必须用 tauri build；cargo build --release
                                               # 出来的 exe 会去连 localhost:1420
+```
+
+带签名的更新产物需要额外两个环境变量，缺了 `tauri build` 会拒绝生成 `.sig`：
+
+```bash
+TAURI_SIGNING_PRIVATE_KEY="$USERPROFILE/.tauri/yolo-trainer.key" \
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" npx tauri build
+```
+
+发版（自动完成构建、tag、Release、latest.json、资产核对）：
+
+```powershell
+powershell -File scripts/release.ps1 -Notes "这次改了什么"
+# -SkipBuild 只重传现有产物；-Draft 发草稿，不切 latest 指针
 ```

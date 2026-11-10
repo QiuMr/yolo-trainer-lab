@@ -32,8 +32,20 @@
       }
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ0ODUxNUI2NTIyMDE0ODgKUldTSUZDQlN0aFdGUkF4YmovQVora0VJaTQ3RkdOZkQxaDhhaUhzT0l2Z2xRTmhGN1RwL1M2dXcK",
+      "endpoints": [
+        "https://github.com/QiuMr/yolo-trainer-lab/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": ["nsis"],
     "externalBin": ["binaries/montgomery"],
     "icon": [

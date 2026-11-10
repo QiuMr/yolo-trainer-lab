@@ -385,3 +385,74 @@ AI 客户端调用 curl / fetch 也更简单：一次请求一次响应，不需
 
 **代价**：最低延迟 = 轮询间隔。对训练进度无所谓；如果将来要推送"训练崩了"这种即时事件，
 再考虑加一个 `GET /watch`（长轮询，最多挂 25 秒），仍然不引 SSE。
+
+---
+
+## D020 · 自动更新用官方 `tauri-plugin-updater`，不照搬 OCR-Studio 的自研方案
+
+**决定**：NSIS 安装包 + minisign 签名 + GitHub Releases 的固定 `latest.json` 资产，客户端通过
+官方插件下载并拉起安装器。参考了 `D:\Python测试\OCR-Studio` 的发版流程，但**替换了更新机制本身**。
+
+**理由**：OCR-Studio 的 `bundle.active = false`，发的是免安装 zip，所以"更新 = 整目录覆盖"是
+对的。本项目 `bundle.active = true` + NSIS，安装会写注册表、卸载项和开始菜单。若照搬覆盖法：
+
+1. 覆盖后注册表里的版本/卸载信息仍指向旧版，控制面板显示错误版本，卸载可能删不干净。
+2. `externalBin` 的 144 MB `montgomery.exe` 与 WebView2 加载的 DLL 在主进程运行时被占用，
+   覆盖会 `ERROR_SHARING_VIOLATION`，留下半新半旧的目录。
+3. 自研方案必须复制当前 exe 当"更新助手"，且**必须在单实例插件之前分流**，还得轮询 PID
+   并校验进程镜像路径（Windows 会复用 PID）。这三个坑 OCR-Studio 的 `updater.rs` 都踩过。
+
+官方插件让 NSIS 安装器接手，上述三类问题一并消失；签名校验也比自写 sha256 更强（防篡改）。
+
+**借鉴了什么**：版本号唯一来源（`tauri.conf.json`）、`releases/latest/download/latest.json`
+这个永不变更的 feed URL、发版全脚本化 + **核对 Release 资产而不是读退出码**、无 BOM JSON、
+网络失败收敛成一句人话而不是红字报错。
+
+**被否决**：
+- *自研 zip 覆盖*：见上，与 NSIS 的分发模型冲突。
+- *GitHub Actions 自动构建*：引擎二进制来自 AGPL 上游且 137 MiB，CI 上既要构建上游又要传大
+  文件；本机脚本发版已足够，等真有多人协作再上 CI。
+
+---
+
+## D021 · GitHub 仓库必须是 public
+
+**决定**：`QiuMr/yolo-trainer-lab` 以公开仓库创建。
+
+**理由**：`releases/latest/download/<asset>` 对**私有**仓库的资产需要带令牌才能下载，而客户端
+是匿名请求。私有仓库会让自动更新在第一次检查时就 404。这不是偏好问题，是机制约束。
+
+**代价与缓解**：桌面壳源码公开可见（尚未选开源许可证，默认保留所有权利）；密钥、令牌、
+本机路径、构建产物一律不入库（`.gitignore` + 发版前扫描）。若将来必须私有，得把 feed 挪到
+可匿名读取的托管（R2 / Pages），客户端改一行 endpoint 即可——`tauri.conf.json` 里只有这一处。
+
+---
+
+## D022 · 版本号只有一个来源
+
+**决定**：`desktop/src-tauri/tauri.conf.json` 的 `version`。`build.rs` 读它并注入
+`YOLO_TRAINER_VERSION`；Tauri CLI 用它命名安装包；`scripts/release.ps1` 用它打 tag 和写
+`latest.json`；Rust 的 `version.rs` 只读 `env!`。`Cargo.toml` / `package.json` 的 version 字段
+不参与任何判断。
+
+**理由**：三份版本号一定会漂。漂了的后果不是编译报错，而是客户端拿一个过时的版本去比，
+**永远显示"已是最新"**——用户不会报 bug，只会一直用旧版。`build.rs` 还断言版本必须是三段
+数字，拼错当场失败。
+
+**被否决**：`env!("CARGO_PKG_VERSION")` —— 读的是 `Cargo.toml`，正是那个会漂的第二份。
+
+---
+
+## D023 · 签名私钥不入库，且暂不启用 `requireSignedVersion`
+
+**决定**：私钥在 `%USERPROFILE%\.tauri\yolo-trainer.key`，`.gitignore` 明确排除 `*.key`；仓库里
+只有公钥字符串。`tauri.conf.json` 不设 `requireSignedVersion`。
+
+**理由**：私钥泄漏等于任何人都能发布"通过校验"的假更新，这是不可回滚的事故。
+`requireSignedVersion` 要求签名的 trusted comment 里带版本号；实测 Tauri CLI 2.12.4 生成的
+`.sig` 只带 `timestamp` 与 `file`，启用会让当前所有包被拒。**等 CLI 开始写版本号、并把所有
+存量 Release 重新签过之后再开**，否则客户端会集体升级失败。
+
+**附带结论**：NSIS 目标下 `createUpdaterArtifacts: true` 产出的是 `<setup>.exe` + `<setup>.exe.sig`，
+**没有 `.nsis.zip`**。签名字符串嵌进 `latest.json`，所以 Release 只需上传安装包与 `latest.json`
+两个资产。发版脚本最初按 `.nsis.zip` 写，是实测产物名之后改的。

@@ -392,3 +392,102 @@ montgomery stdout ──▶ hub ──▶ 订阅线程 ──┬─▶ RunState�
 ```
 
 所以界面显示到第 7 轮时，`/state` 也一定是第 7 轮。不存在两份进度。
+
+---
+
+## 10. 自动更新（客户端 ↔ GitHub Releases）
+
+第 8 节的命令契约在这里补全更新相关的三个命令；具体选型理由见 `DECISIONS.md` D020–D023。
+
+### 10.1 命令
+
+| 命令 | 入参 | 返回 | 备注 |
+| --- | --- | --- | --- |
+| `app_version` | 无 | `string`，如 `"0.1.0"` | 由 `build.rs` 从 `tauri.conf.json` 注入，前端不硬编码 |
+| `check_update` | 无 | `UpdateInfo` | **永远成功**；网络/解析失败放在 `error` 字段里 |
+| `install_update` | 无 | `Result<(), String>` | Windows 上成功会**退出进程**，Promise 通常不会 settle |
+
+三个命令都是 `async`（`check_update` / `install_update` 需要发 HTTPS 请求），不会阻塞命令线程。
+浏览器预览（`!isTauri`）下 `getAppVersion()` 返回 `"预览模式"`，`checkUpdate()` 返回带 `error`
+的 `UpdateInfo`，`installUpdate()` 抛错——不会伪造一个版本号。
+
+### 10.2 `UpdateInfo`
+
+```jsonc
+{
+  "current": "0.1.0",       // 当前程序版本
+  "latest": "0.1.1",        // 远端版本；无更新时等于 current（不会是空串）
+  "has_update": true,
+  "notes": "修复了…",        // Release notes，可能含换行；无内容时 ""
+  "error": null             // 非空 = "没能检查"，与 "没有更新" 是两种不同的状态
+}
+```
+
+字段是 **snake_case**（与 Rust 的 `Serialize` 默认一致），不是驼峰。
+`error` 是收敛后的人话：`ReleaseNotFound` → "更新源还没有发布记录"，超时/连接失败 →
+"连不上更新服务器…"，不会把原始错误串丢给界面。
+
+### 10.3 `update-progress` 事件
+
+`install_update` 期间由 Rust 侧 `Emitter` 发出，前端用 `listen` 订阅：
+
+```jsonc
+{ "phase": "downloading", "percent": 42 }
+{ "phase": "installing", "percent": 100 }
+```
+
+`percent = -1` 表示服务端没给 `Content-Length`，此时界面不画进度条。事件**按百分比变化节流**，
+不是每个下载块都发一次（8 KB 一块会淹没 webview）。`installing` 是界面能看到的最后一个状态。
+
+### 10.4 `latest.json`（feed 契约）
+
+固定地址：`https://github.com/QiuMr/yolo-trainer-lab/releases/latest/download/latest.json`。
+`releases/latest/download/<asset>` 永远指向最新一个非草稿 Release，所以发新版**不用改客户端**。
+
+```jsonc
+{
+  "version": "0.1.1",
+  "notes": "修复了…",
+  "pub_date": "2026-11-11T02:30:00Z",
+  "platforms": {
+    "windows-x86_64": {
+      "url": "https://github.com/QiuMr/yolo-trainer-lab/releases/download/v0.1.1/YOLO%20Trainer_0.1.1_x64-setup.exe",
+      "signature": "<base64 字符串，内容就是 .exe.sig 文件>"
+    }
+  }
+}
+```
+
+- `version` 必须是三段数字，不带 `v` 前缀（插件会 `trim_start_matches('v')`，但发版脚本不带）。
+- `pub_date` 是 RFC3339 UTC。
+- 平台键：插件依次尝试 `windows-x86_64-nsis` 和 `windows-x86_64`，命中任一即可。
+  NSIS 是本项目唯一目标，用通用键。
+- `url` 里的空格**必须** percent-encode（`[uri]::EscapeDataString`），否则下载 404。
+- `signature` 是 `.exe.sig` 文件的全部内容（base64 编码的 minisign 签名），首尾空白要去掉。
+- JSON **必须无 BOM**：serde_json 遇到 BOM 直接解析失败，而每次启动都要读它。
+
+### 10.5 发版产物
+
+`createUpdaterArtifacts: true` 在 NSIS 目标下产出两个文件，**没有 `.nsis.zip`**：
+
+| 文件 | 是否上传 | 用途 |
+| --- | --- | --- |
+| `YOLO Trainer_<ver>_x64-setup.exe` | 是 | 用户手动安装 + 更新器下载 |
+| `YOLO Trainer_<ver>_x64-setup.exe.sig` | 否 | 内容嵌进 `latest.json.signature` |
+
+Release 资产共两个：安装包与 `latest.json`。`scripts/release.ps1` 会核对两者都在
+（gh 上传大文件中断时可能留下只有 JSON 的空壳 Release），缺了自动补传。
+
+### 10.6 失败语义（重要）
+
+| 情形 | 客户端表现 |
+| --- | --- |
+| 还没发过 Release | `error` = "更新源还没有发布记录"，不弹红框 |
+| 离线 / 公司代理 | `error` = 一句可读提示；设置页用浅色文字，不用 danger 色 |
+| 版本相同或更旧 | `has_update = false`，界面显示"已是最新版本" |
+| feed 版本号比当前旧但插件仍返回更新 | `install_update` 显式拒绝，报"更新源指向 v… 已中止" |
+| 签名不匹配 | 下载阶段报错，安装包**不会运行**（插件先验签再 `install`） |
+| 安装成功 | Windows 上进程退出 → NSIS `/P` 静默安装 → `/R` 自动重启 |
+
+私钥在 `%USERPROFILE%\.tauri\yolo-trainer.key`，不入库。`requireSignedVersion` **未启用**：
+Tauri CLI 2.12.4 的 `.sig` trusted comment 只带 `timestamp` 与 `file`，启用会让当前所有包被拒。
