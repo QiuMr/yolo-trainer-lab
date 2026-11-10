@@ -285,3 +285,14 @@ TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" npx tauri build
 powershell -File scripts/release.ps1 -Notes "这次改了什么"
 # -SkipBuild 只重传现有产物；-Draft 发草稿，不切 latest 指针
 ```
+
+更新链路自检（不用启动应用，12 项断言）：
+
+```bash
+python spikes/qa/probe_update.py                 # 检查 latest Release
+python spikes/qa/probe_update.py --tag v0.1.0   # 检查指定 Release
+python spikes/qa/probe_update.py --sig <本地 .exe.sig>   # 顺便比对签名
+```
+
+它会验：feed 匿名可读且无 BOM、字段齐全、资产 URL 无空格且能下载、
+**签名 trusted comment 里的 `version:` 与 feed 一致**（`requireSignedVersion` 的前提）。

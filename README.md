@@ -90,6 +90,12 @@ npx tauri signer generate --ci --password "" -w "$USERPROFILE/.tauri/yolo-traine
 - `latest.json` 由发版脚本生成，内含 `version / notes / pub_date / platforms.windows-x86_64.{url,signature}`。
 - 安装包装的是 `currentUser` 模式；训练产物、数据集与设置都在 `%APPDATA%`，升级不覆盖。
 
+发完版先跑一遍自检（不用启动应用）：
+
+```bash
+python spikes/qa/probe_update.py        # 12 项断言：feed、签名版本一致性、资产可下载
+```
+
 **为什么用官方 `tauri-plugin-updater` 而不是自己解压覆盖**：本项目发的是 NSIS 安装包，要维护注册表与卸载项；直接覆盖文件会留下指向旧版本的卸载信息，且 `externalBin` 引擎可能被占用。官方插件让真正的安装器接手，省掉了「更新助手进程 + 等 DLL 句柄释放」这一整类问题。
 
 ## 架构
