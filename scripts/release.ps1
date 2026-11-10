@@ -215,7 +215,9 @@ Info "创建 Release..."
 function Get-AssetNames {
   $v = Invoke-Gh @("release", "view", $tag, "--repo", $slug, "--json", "assets")
   if ($v.Code -ne 0) { return $null }
-  try { return @(($v.Out | ConvertFrom-Json).assets | ForEach-Object { $_.name }) } catch { return $null }
+  # Trim: `Invoke-Native` merges stdout+stderr, and a trailing CR on a name would make the
+  # `-notcontains` comparison below silently miss an asset that is actually there.
+  try { return @(($v.Out | ConvertFrom-Json).assets | ForEach-Object { ($_.name).Trim() }) } catch { return $null }
 }
 $expected = @($uploadName, "latest.json")
 $names = Get-AssetNames
