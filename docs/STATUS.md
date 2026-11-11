@@ -16,6 +16,38 @@
 | 训练 1 epoch（CPU） | `train --epochs 1 --no-val` | ✅ `loss 4573.58`，产出 checkpoints + exports |
 | 训练产物推理 | `predict --model exports/best.bpk` | ✅ 正常输出检测结果、写出标注图 |
 
+## 预训练权重按需下载（2026-11-11 晚上）
+
+用户提出权重放 GitHub、用时下载。安装包因此仍是 29 MB，且能提供全部档位（D029）。
+
+| 项目 | 状态 | 怎么验的 |
+| --- | --- | --- |
+| 清单与 Release 资产一致 | ✅ 15/15 | `gh release view` 逐条比对文件名与字节数，双向 0 差异 |
+| 真实下载 + 摘要校验 | ✅ | `--ignored` 网络测试：`yolo26n.bpk` 5.1 MB / 12.7 秒，sha256 通过 |
+| 截断文件被拒 | ✅ | 单测：长度不符 → "文件大小不符"；长度对内容错 → "校验不通过" |
+| 界面下载进度 | ✅ | 实测截图：0.0 → 2.0 / 5.1 MB，进度条同步推进；`.part` 落盘 3 MB |
+| 下载后自动开始训练 | ✅ | `.part` → 5,364,896 B（与清单一致）；日志 `Initialized 492 tensors … 90 classification-tower tensors` |
+| 训练真的在推进 | ✅ | 界面 3/100 轮，loss 456.56 → 411.91 → 350.13，每轮 64.7 秒，曲线同步绘制 |
+| n 档塔宽修复 | ✅ | 新引擎下 `yolov8n` 261+6+**30**、`yolo26n` 492+12+**90** 个塔张量按预期重初始化，1 轮训练均正常 |
+| 预训练 vs 从零 | ✅ | mAP **3.22% vs 0.013%**（251 倍）；从零模型 0 检出，预训练 person 38.3% |
+| 四模式布局 | ✅ | 截图实测：一行四个，"官方通用权重，首次使用时下载"换行不溢出 |
+| 权重信息条 | ✅ | `COCO 预训练 · 已有 80 类` + `首次训练前下载 5.1 MB` |
+| 桌面单测 | ✅ 43 passed / 2 ignored | 新增 3 项：清单自洽、摘要拒绝、真实下载（ignored） |
+| 前端 | ✅ | `tsc --noEmit` 干净、`vite build` 1.2s |
+
+### 两个踩到的坑（都已处理）
+
+1. **引擎有两处副本都不会自动更新**：改完 `research/montgomery` 只构建
+   `artifacts/target-dist/release/montgomery.exe` 是不够的——应用实际跑的是
+   `desktop/src-tauri/binaries/montgomery-*.exe` **和** `artifacts/desktop-target/release/montgomery.exe`，
+   而 `Copy-Item` 默认保留源文件的旧时间戳，tauri 因此认为没变化、拒绝覆盖。表现是
+   "补丁明明打了、行为却没变"：界面点开始训练，引擎以代码 1 退出，日志里还是那 80 个 mismatch。
+   现在三件事兜住它：`scripts/sync-engine.ps1` 一条命令同步并盖新时间戳；
+   `scripts/release.ps1` 比对时间戳，过期**直接失败**；本文档记录这条因果关系。
+2. **`reqwest` 的 `rustls-no-provider` 不会自己装加密后端**：第一次真实下载时，
+   在 reqwest 自己的工作线程里 panic，冒泡上来只有一句 `event loop thread panicked`。
+   必须在建 Client 前 `rustls::crypto::ring::default_provider().install_default()`。
+
 ## 模型目录收窄到 45 个（2026-11-11 下午）
 
 用户问"哪些常用、哪些肯定用不到"。按此把界面与 ONNX 骨架一起砍到 3 家族 × 3 任务 × 5 档，

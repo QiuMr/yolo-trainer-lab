@@ -66,3 +66,42 @@ yolo26 的 `head.o2m_*` 是训练辅助头：`forward()` 只走 one2one 单头�
 **必须在 `--features training,onnx` 下编译。** 生成的骨架由 `tools/onnx_skeleton/generate_all.py`
 产出，和这个补丁是配套的：骨架清单的字段（`source`/`class_dependent`/`scalars`/`attributes`）
 就是这里读的契约。
+
+## 0005 · 机器可读事件 + n 档分类塔宽允许重排
+
+这个补丁包含两件事，必须一起说明。
+
+### (a) `src/training/events.rs`：此前遗漏的补丁，本次补入
+
+`events.rs`（JSONL 训练事件）和 `runtime.rs` 里的两处 `events::emit` 是更早一轮做 UI 实时曲线时
+加进上游源码的，**但当时没有生成补丁**。后果是：按本 README 重新构建会得到一个不发事件的引擎，
+而 `desktop` 侧完全依赖 `{"type":"start"|"epoch"|"end"}` 这几行渲染进度——UI 会一直停在
+"等待第一轮"，且很难联想到是引擎少打了一个补丁。
+
+教训：`research/` 被 gitignore，改完上游第一件事就是出补丁，否则等于没改。
+
+### (b) `transfer_pretrained` 允许分类塔宽随类别数变化
+
+`Detect` 的分类塔宽是 `max(ch[0], min(nc, 100))`。只有 `n` 档的 `ch[0] = 64` 低于 100，
+所以只有 n 档会出现"塔宽跟着类别数走"：80 类的检查点塔宽 80，3 类模型塔宽 64，
+`cls_0`/`cls_dw_0` 这些卷积**形状不同，结构上就搬不过去**。
+
+原实现只允许 `.cls_out.`（投影层）被替换，于是 80 类 → 3 类的微调在 n 档直接失败：
+
+```
+pretrained transfer differed outside the documented class projections:
+  ... 30 shape errors
+```
+
+改法：把落在分类塔内的 `ShapeMismatch` 从 `errors` 里摘出来，记为"新初始化"，
+其余（区块、主干、任何其它形状不符）仍然致命。这与 Ultralytics 的 `intersect_dicts`
+行为一致——形状不符的键直接丢弃。同时加了 `ReplacedProjection::tolerates_tower_resize()`，
+只有 `Detector`/`Yolo26Segment` 允许；分类头的 `head.linear` 没有塔，YOLOX/YOLOv3 的类别分支
+命名不同（`head.cls_preds.N`），都不放行。
+
+**安全性**：拿错架构的权重会连主干一起不匹配，仍然报错，不会静默加载出一个半随机模型。
+
+实测（yolov8n，60 张 3 类图，320 输入，30 轮）：
+- 修复前：`--model yolov8n.bpk` 直接失败
+- 修复后：`Initialized 291 tensors ... freshly initialized 6 class-projection tensors and 6
+  classification-tower tensors`，mAP 3.22%，对照"从零"为 0.013%

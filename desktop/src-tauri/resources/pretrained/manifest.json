@@ -1,0 +1,171 @@
+{
+  "version": 1,
+  "base_url": "https://github.com/QiuMr/yolo-trainer-lab/releases/download/weights-v1/",
+  "weights": [
+    {
+      "arch": "yolo11n-cls",
+      "family": "yolo11",
+      "scale": "n",
+      "task": "classify",
+      "file": "yolo11n-cls.bpk",
+      "bytes": 5712336,
+      "sha256": "d09ad83d28b6a4adae8f4a6046b1d5b3941e9b55006501364c8c16bebe96279d",
+      "classes": 1000,
+      "dataset": "ImageNet"
+    },
+    {
+      "arch": "yolo11n-seg",
+      "family": "yolo11",
+      "scale": "n",
+      "task": "segment",
+      "file": "yolo11n-seg.bpk",
+      "bytes": 5919808,
+      "sha256": "9792bc2e2f5dfa51f22a69347b0ccdf63b8aaa06e3d582178e2c817693833c52",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolo11n",
+      "family": "yolo11",
+      "scale": "n",
+      "task": "detect",
+      "file": "yolo11n.bpk",
+      "bytes": 5400224,
+      "sha256": "1de4843cd55c91ee008fdb64835d26aa394ef85fc8199fb46cbe09097d40113a",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolo11s",
+      "family": "yolo11",
+      "scale": "s",
+      "task": "detect",
+      "file": "yolo11s.bpk",
+      "bytes": 19140768,
+      "sha256": "47a77e3a676147a51239b81aec9f971fcf25f60bcd9765b7a4b2182d5b7ea80d",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolo26n-cls",
+      "family": "yolo26",
+      "scale": "n",
+      "task": "classify",
+      "file": "yolo26n-cls.bpk",
+      "bytes": 5712336,
+      "sha256": "260014b7d0d26f4f66bae7689de969fbe8503cabea325ab3dccd44018680bdb4",
+      "classes": 1000,
+      "dataset": "ImageNet"
+    },
+    {
+      "arch": "yolo26n-seg",
+      "family": "yolo26",
+      "scale": "n",
+      "task": "segment",
+      "file": "yolo26n-seg.bpk",
+      "bytes": 6503744,
+      "sha256": "e2af8b3ca377569bf08907bd6504e478254cd750ad88ab92dd2832ba3bbaf53c",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolo26n",
+      "family": "yolo26",
+      "scale": "n",
+      "task": "detect",
+      "file": "yolo26n.bpk",
+      "bytes": 5364896,
+      "sha256": "1601534dd8924b75f49430586db42767db6d21110f34edeeb8d7b14025d67c8c",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolo26s",
+      "family": "yolo26",
+      "scale": "s",
+      "task": "detect",
+      "file": "yolo26s.bpk",
+      "bytes": 20318368,
+      "sha256": "04ce355d7fb24ad45437e913d82fd5e9acc81e3fa35115f7d4ccb229c6c61369",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolov8l",
+      "family": "yolov8",
+      "scale": "l",
+      "task": "detect",
+      "file": "yolov8l.bpk",
+      "bytes": 87710368,
+      "sha256": "70d6279c8979fa39513ee0b5ee3d0cab215e9c7996521165811c5cf85f4a06cd",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolov8m",
+      "family": "yolov8",
+      "scale": "m",
+      "task": "detect",
+      "file": "yolov8m.bpk",
+      "bytes": 52056224,
+      "sha256": "6686bceffb4efea845e281db4b2ef9ed6d933b65692c436c54f901da7f3a727d",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolov8n-cls",
+      "family": "yolov8",
+      "scale": "n",
+      "task": "classify",
+      "file": "yolov8n-cls.bpk",
+      "bytes": 5498064,
+      "sha256": "847d82b2c7bf7c73b760985809bb319ef0191ee03a8011053837810f88721b25",
+      "classes": 1000,
+      "dataset": "ImageNet"
+    },
+    {
+      "arch": "yolov8n-seg",
+      "family": "yolov8",
+      "scale": "n",
+      "task": "segment",
+      "file": "yolov8n-seg.bpk",
+      "bytes": 6937664,
+      "sha256": "2ef3c6e2cc7c88ac2d4432ac6ceefdd012425111f4a6e9c1ec672f6dc0550e61",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolov8n",
+      "family": "yolov8",
+      "scale": "n",
+      "task": "detect",
+      "file": "yolov8n.bpk",
+      "bytes": 6418080,
+      "sha256": "d8b9cb5ee804a60574d3f6d69299817e5fd77a753bd97091f0c768ead778f85a",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolov8s",
+      "family": "yolov8",
+      "scale": "s",
+      "task": "detect",
+      "file": "yolov8s.bpk",
+      "bytes": 22483360,
+      "sha256": "9d28d12f6c7148008f718a0215945fbf73c0ffe1cdd0c82ab4e7f3226d8f3d37",
+      "classes": 80,
+      "dataset": "COCO"
+    },
+    {
+      "arch": "yolov8x",
+      "family": "yolov8",
+      "scale": "x",
+      "task": "detect",
+      "file": "yolov8x.bpk",
+      "bytes": 136876960,
+      "sha256": "8dffc28f16f73c5050e2e22c2a01db724ce5220c63776787f203b06656956fef",
+      "classes": 80,
+      "dataset": "COCO"
+    }
+  ]
+}

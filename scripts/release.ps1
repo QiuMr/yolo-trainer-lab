@@ -112,6 +112,20 @@ $external = @(Get-ChildItem (Join-Path $desktop "src-tauri\binaries") -Filter "m
 if ($external.Count -eq 0) {
   Fail "externalBin 里没有 montgomery-<triple>.exe。见 README.md 的「构建前置」"
 }
+
+# 引擎比刚构建出来的产物旧 = 改过 research/montgomery 却没同步到 externalBin。
+# 这类错误在构建和启动时都不报，只表现为"补丁明明打了、行为却没变"——实测踩过一次：
+# n 档塔宽修复没进安装包，界面点开始训练直接以"引擎进程退出，代码 1"收场。
+$freshEngine = Join-Path $root "artifacts\target-dist\release\montgomery.exe"
+if (Test-Path $freshEngine) {
+  $built = (Get-Item $freshEngine).LastWriteTime
+  foreach ($exe in $external) {
+    if ($exe.LastWriteTime -lt $built) {
+      Fail ("externalBin 的引擎比 artifacts\target-dist\release\montgomery.exe 旧（{0:HH:mm} < {1:HH:mm}）。" +
+            "`n  先同步：Copy-Item '{2}' '{3}' -Force") -f $exe.LastWriteTime, $built, $freshEngine, $exe.FullName
+    }
+  }
+}
 $auth = Invoke-Gh @("auth", "status")
 if ($auth.Code -ne 0) { Fail "gh 未登录：`n$($auth.Out)" }
 

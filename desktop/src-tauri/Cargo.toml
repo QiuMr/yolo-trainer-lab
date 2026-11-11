@@ -27,6 +27,19 @@ tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Pretrained weights are fetched on demand from a GitHub Release. `reqwest` rather than a new HTTP
+# crate because the updater plugin already pulls it in — reusing it costs no new dependency, and D
+# drive (the shared cargo cache) is out of space, so a fresh download would not even build. The
+# blocking client is used from a dedicated thread: the download loop reads the body in chunks to
+# emit progress, which is awkward to express in an async stream for no benefit.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls-no-provider"] }
+# `rustls-no-provider` deliberately leaves the crypto backend to the application, so one has to be
+# installed before the first client is built. `ring` because it is already compiled into the tree
+# (the updater brings it in); `default-features = false` keeps rustls from adding aws-lc-rs, which
+# would be a new crate to download and a C toolchain to build.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = "0.10"
+tokio = { version = "1", features = ["sync"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

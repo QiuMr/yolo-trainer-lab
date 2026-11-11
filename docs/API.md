@@ -555,3 +555,71 @@ CLI 2.12.4 的签名 trusted comment 是 `timestamp:…\tfile:…\tversion:<ver>
 `plugins.updater.windows.installMode` 用 **`quiet`**（NSIS `/S`），不是官方默认的 `passive`
 （`/P`）：实测 passive 的进度窗口在非交互 / 受 UIPI 约束的会话里无法完成，安装器退出却没
 落地；quiet 用同一组参数 `/S /UPDATE /R /ARGS` 成功升级并自动重启（D024）。
+
+---
+
+## 11. 预训练权重（按需下载）
+
+安装包**不含**权重，只含一份清单（`resources/pretrained/manifest.json`，编译进二进制）。
+用某个架构训练时才下载对应 `.bpk`，缓存到 `%LOCALAPPDATA%\com.yolotrainer.desktop\weights\`。
+为什么不是内置，见 D029。
+
+### 11.1 `pretrained_catalog()` → `WeightView[]`
+
+```ts
+type WeightView = {
+  arch: string;      // "yolov8n" / "yolo11n-seg" / "yolo26n-cls"
+  family: string;    // yolo26 | yolo11 | yolov8
+  scale: string;     // n | s | m | l | x
+  task: string;      // detect | segment | classify
+  bytes: number;     // 下载体积，UI 直接显示
+  classes: number;   // 预训练时的类别数：检测/分割 80，分类 1000
+  dataset: string;   // "COCO" | "ImageNet"
+  cached: boolean;   // 已在本地且摘要通过
+  path: string | null;
+};
+```
+
+同步、无网络。UI 在训练页挂载时调用一次，下载完成后再调一次刷新 `cached`。
+
+### 11.2 `download_pretrained(arch: string)` → `string`
+
+返回可直接喂给 `start_training` 的 `finetune.model` 路径。
+
+- 本地已有且摘要通过 → 立即返回，**不联网**（但仍重算一次 sha256）
+- 需要下载 → 先写 `<file>.part`，校验大小 + sha256 通过后才 `rename` 成正式文件
+- 校验不过 → 删除临时文件并报错，**绝不落盘成可训练文件**
+- 网络失败 → 文案里带文件名和目标目录，用户可手动放置后重试（离线路径）
+- 服务器非 2xx（例如某个权重还没发布）→ 单独一句"服务器返回 404"
+
+失败信息是给用户看的，不要在这一层改写引擎/网络的原文以外的东西。
+
+### 11.3 `pretrained-progress` 事件
+
+```ts
+type PretrainedProgress = {
+  arch: string;
+  phase: "download" | "verify" | "done";
+  received: number; // 字节
+  total: number;
+};
+```
+
+- `download`：起始立刻发一次（0 字节），之后**每 1 MB** 一次。130 MB 的 `yolov8x` 约 130 个事件，
+  不是每块都发。
+- `verify`：写完后、算摘要前
+- `done`：改名成功后，UI 收到即可把进度条撤掉
+
+### 11.4 清单契约
+
+`manifest.json` 由 `tools/pretrained/gen_manifest.py` 生成，字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `version` | 清单格式版本，目前 1 |
+| `base_url` | 必须以 `https://` 开头、以 `/` 结尾（文件名直接拼接） |
+| `weights[].sha256` | 64 位小写 hex；长度或摘要任一不符即拒绝 |
+| `weights[].bytes` | 精确字节数，同时用作下载进度分母 |
+
+生成脚本会断言 `base_url` 的 https 与斜杠——这两个错误只在用户下载 404 时才暴露。
+当前 release tag：`weights-v1`（15 个资产，与清单逐条核对过大小）。

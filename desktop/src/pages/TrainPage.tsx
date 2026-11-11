@@ -3,6 +3,7 @@ import {
   Boxes,
   CopyPlus,
   Cpu,
+  Download,
   FolderOpen,
   Gauge,
   History,
@@ -17,9 +18,14 @@ import {
 import { Button, Card, SectionTitle, cx } from "../components/ui";
 import NumberField from "../components/NumberField";
 import {
+  downloadPretrained,
+  onPretrainedProgress,
   pickFolder,
   pickModelFile,
+  pretrainedCatalog,
   startTraining,
+  type PretrainedProgress,
+  type PretrainedWeight,
   type TrainInit,
 } from "../lib/api";
 import {
@@ -42,9 +48,11 @@ const DEVICES = [
 /**
  * Where the weights come from.
  *
- * `finetune` and `resume` look similar in a menu and are not: a `.bpk` starts a **new** run with a
- * fresh optimizer, while a checkpoint continues the old one. The notes below are the only thing
- * standing between those two meanings, so they say what is kept rather than naming the files.
+ * `pretrained`, `finetune` and `resume` all read a `.bpk` and are still three different things:
+ * `pretrained` is the official COCO/ImageNet checkpoint for the architecture you picked (kept by
+ * the app, fetched once), `finetune` is a `.bpk` of your own, and `resume` continues a run with its
+ * optimizer, EMA and epoch counter. The notes below say what is *kept*, because the file names are
+ * identical and the difference is invisible otherwise.
  */
 const INIT_MODES = [
   {
@@ -52,6 +60,12 @@ const INIT_MODES = [
     label: "从零开始",
     icon: Plus,
     note: "随机初始化，不用预训练权重",
+  },
+  {
+    id: "pretrained" as const,
+    label: "用预训练权重",
+    icon: Download,
+    note: "官方通用权重，首次使用时下载",
   },
   {
     id: "finetune" as const,
@@ -73,6 +87,12 @@ type InitMode = (typeof INIT_MODES)[number]["id"];
 function tailPath(path: string, segments = 2): string {
   const parts = path.split(/[\\/]+/).filter(Boolean);
   return parts.slice(-segments).join("/");
+}
+
+/** Weights run from 5 to 130 MB; a raw byte count is unreadable and a round number would hide the
+ *  difference between "one second" and "a minute" on a slow link. */
+function megabytes(bytes: number): string {
+  return `${(bytes / 1048576).toFixed(1)} MB`;
 }
 
 /** One labelled row inside the model card. The label is a caption, not a heading — it should
@@ -132,11 +152,35 @@ export default function TrainPage({
   const [imgszEdited, setImgszEdited] = useState(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** What the build can fetch, annotated with what is already on disk. */
+  const [weights, setWeights] = useState<PretrainedWeight[]>([]);
+  /** Live byte counter while a weight downloads; null when nothing is in flight. */
+  const [progress, setProgress] = useState<PretrainedProgress | null>(null);
+  /** True from "start pressed" until the weight is on disk and training actually starts. */
+  const [preparing, setPreparing] = useState(false);
 
   const selection = resolveSelection(taskId, familyKey, scaleId);
   const model = selection.id;
   const problem = taskProblem(selection.task, dataset);
   const running = status === "running";
+  /** The pretrained entry for the architecture currently selected, if the build offers one. */
+  const weight = weights.find((item) => item.arch === model) ?? null;
+
+  // The catalog is a few `stat`s, so it is read on mount and again after a download rather than
+  // cached across sessions: a file the user deleted by hand must not stay "ready" in the UI.
+  useEffect(() => {
+    let alive = true;
+    void pretrainedCatalog().then((list) => {
+      if (alive) setWeights(list);
+    });
+    const stop = onPretrainedProgress((event) => {
+      setProgress(event.phase === "done" ? null : event);
+    });
+    return () => {
+      alive = false;
+      void stop.then((off) => off());
+    };
+  }, []);
 
   // Classification at 640 is slower and no more accurate, so the default follows the task — but
   // only while the value is still ours. Overwriting a number someone typed is worse than a
@@ -169,16 +213,19 @@ export default function TrainPage({
 
   const ready =
     !running &&
+    !preparing &&
     (initMode === "scratch"
       ? Boolean(dataset) && paramsValid && problem === null
-      : initMode === "finetune"
-        ? Boolean(dataset) && paramsValid && Boolean(modelPath)
-        : // Resume needs neither a dataset nor parameters: the checkpoint carries all three of
-          // dataset, batch size and epoch budget.
-          Boolean(checkpointPath));
+      : initMode === "pretrained"
+        ? Boolean(dataset) && paramsValid && problem === null && weight !== null
+        : initMode === "finetune"
+          ? Boolean(dataset) && paramsValid && Boolean(modelPath)
+          : // Resume needs neither a dataset nor parameters: the checkpoint carries all three of
+            // dataset, batch size and epoch budget.
+            Boolean(checkpointPath));
 
   /** What the user still has to do, or null when nothing is missing. Drives the action bar; keeps
-   *  the three modes from each needing their own copy of "have I got everything". */
+   *  the modes from each needing their own copy of "have I got everything". */
   const missing =
     initMode === "resume"
       ? checkpointPath
@@ -188,21 +235,35 @@ export default function TrainPage({
         ? "选一个数据集"
         : initMode === "finetune" && !modelPath
           ? "选一个已有模型"
-          : null;
+          : initMode === "pretrained" && !weight
+            ? "这个架构没有预训练权重"
+            : null;
 
   async function start() {
     // `ready` already gates the button; repeating the check keeps any other caller of start() from
     // launching a combination the scanner described as incompatible.
     if (!ready) return;
-    const init: TrainInit =
-      initMode === "scratch"
-        ? { mode: "scratch", architecture: model }
-        : initMode === "finetune" && modelPath
-          ? { mode: "finetune", model: modelPath }
-          : { mode: "resume", checkpoint: checkpointPath ?? "" };
     setStarting(true);
     setError(null);
     try {
+      let init: TrainInit;
+      if (initMode === "pretrained") {
+        if (!weight) return;
+        // Fetch *before* resetting the run: a download that fails must leave the previous run's
+        // monitor intact rather than blanking it and then reporting an error, and the engine
+        // cannot start against a path that does not exist yet. When the file is already on disk
+        // this returns immediately — the shell verifies the digest either way.
+        setPreparing(true);
+        const resolved = await downloadPretrained(model);
+        setWeights(await pretrainedCatalog());
+        init = { mode: "finetune", model: resolved };
+      } else if (initMode === "scratch") {
+        init = { mode: "scratch", architecture: model };
+      } else if (initMode === "finetune" && modelPath) {
+        init = { mode: "finetune", model: modelPath };
+      } else {
+        init = { mode: "resume", checkpoint: checkpointPath ?? "" };
+      }
       resetRun();
       setState({ status: "running" });
       await startTraining({
@@ -221,6 +282,7 @@ export default function TrainPage({
       setError(message);
       setState({ status: "idle" });
     } finally {
+      setPreparing(false);
       setStarting(false);
     }
   }
@@ -229,7 +291,7 @@ export default function TrainPage({
     <div>
       <h1 className="text-[26px] font-extrabold tracking-tight">训练</h1>
       <p className="mt-2 text-[14px] font-medium text-ink-soft">
-        从零训练，或者接着之前的结果继续。
+        从零训练、接着预训练权重微调，或者继续之前的结果。
       </p>
 
       <Card className="mt-8" enter={0}>
@@ -240,7 +302,7 @@ export default function TrainPage({
         />
 
         <ChoiceRow label="从哪开始">
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-4 gap-2">
             {INIT_MODES.map((item) => {
               const Icon = item.icon;
               const active = initMode === item.id;
@@ -278,7 +340,7 @@ export default function TrainPage({
           </div>
         </ChoiceRow>
 
-        {initMode === "scratch" ? (
+        {initMode === "scratch" || initMode === "pretrained" ? (
           <>
             <ChoiceRow label="任务">
           <div className="grid grid-cols-3 gap-2">
@@ -427,6 +489,59 @@ export default function TrainPage({
             </span>
           </div>
         )}
+
+        {/* Says what the run will actually start from. "Pretrained" alone is not enough: the
+            user needs to know it already recognises 80 COCO classes (so their 3-class set is a
+            narrowing, not a fresh start) and how much the download costs. */}
+        {initMode === "pretrained" ? (
+          weight === null ? (
+            <div className="mt-2 flex items-start gap-2.5 rounded-[10px] border border-warn/25 bg-warn/5 px-3.5 py-2.5">
+              <TriangleAlert
+                size={14}
+                strokeWidth={2.4}
+                className="mt-0.5 shrink-0 text-warn"
+              />
+              <span className="text-[11.5px] leading-relaxed font-semibold text-ink-soft">
+                这个架构还没有预训练权重。目前提供的是各家族的 n 档——换成 n，或者用「用已有模型」导入自己的 .bpk。
+              </span>
+            </div>
+          ) : (
+            <div className="mt-2 rounded-[10px] bg-surface px-3.5 py-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Download size={14} strokeWidth={2.4} className="shrink-0 text-ink-faint" />
+                  <span className="truncate text-[11.5px] font-semibold text-ink-soft">
+                    {weight.dataset} 预训练 · 已有 {weight.classes} 类
+                  </span>
+                </div>
+                <span className="shrink-0 text-[11px] font-bold text-ink-faint">
+                  {weight.cached ? "已就绪" : `首次训练前下载 ${megabytes(weight.bytes)}`}
+                </span>
+              </div>
+              {progress && progress.arch === weight.arch ? (
+                <div className="mt-2">
+                  <div className="h-1.5 overflow-hidden rounded-full bg-surface-sunken">
+                    <div
+                      className="h-full rounded-full bg-ink transition-[width] duration-200 ease-out"
+                      style={{
+                        width: `${
+                          progress.total > 0
+                            ? Math.min(100, Math.round((progress.received / progress.total) * 100))
+                            : 0
+                        }%`,
+                      }}
+                    />
+                  </div>
+                  <span className="mt-1 block text-[10.5px] font-semibold text-ink-faint">
+                    {progress.phase === "verify"
+                      ? "校验文件完整性…"
+                      : `下载中 ${megabytes(progress.received)} / ${megabytes(progress.total)}`}
+                  </span>
+                </div>
+              ) : null}
+            </div>
+          )
+        ) : null}
           </>
         ) : initMode === "finetune" ? (
           <ChoiceRow
@@ -626,12 +741,18 @@ export default function TrainPage({
                 <Wand2 size={15} strokeWidth={2.4} className="shrink-0 text-ink-soft" />
               )}
               <span className="text-[12px] font-semibold text-ink-faint">
-                {initMode === "resume" ? "将续训" : "将创建"}
+                {initMode === "resume"
+                  ? "将续训"
+                  : initMode === "pretrained"
+                    ? "将微调"
+                    : "将创建"}
               </span>
               <span className="tnum truncate text-[13px] font-bold text-ink">
                 {initMode === "resume"
                   ? tailPath(checkpointPath ?? "")
-                  : `${model} · ${epochs} 轮 · batch ${batch} · ${imgsz}px · ${device}`}
+                  : initMode === "pretrained" && weight
+                    ? `${model} ← ${weight.dataset} 预训练 · ${epochs} 轮 · batch ${batch} · ${imgsz}px · ${device}`
+                    : `${model} · ${epochs} 轮 · batch ${batch} · ${imgsz}px · ${device}`}
               </span>
             </>
           ) : (

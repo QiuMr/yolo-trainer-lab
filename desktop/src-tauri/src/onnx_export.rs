@@ -35,27 +35,24 @@ pub struct ExportResult {
     pub bytes: u64,
 }
 
-/// Locate the bundled skeletons.
+/// Locate a bundled resource directory by name (`onnx`, `pretrained`).
 ///
 /// The candidates cover the three layouts this app actually runs in: an installed build (resources
 /// next to the executable), `tauri dev` (the working directory is `src-tauri`), and a plain
 /// `cargo run` from the repository root.
-pub fn resolve_templates() -> Result<PathBuf, String> {
+pub fn resolve_resource(subdir: &str) -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
-    if let Ok(explicit) = std::env::var("MONTGOMERY_ONNX_TEMPLATES") {
-        candidates.push(PathBuf::from(explicit));
-    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("onnx"));
-            candidates.push(dir.join("resources").join("onnx"));
+            candidates.push(dir.join(subdir));
+            candidates.push(dir.join("resources").join(subdir));
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("resources").join("onnx"));
-        candidates.push(cwd.join("src-tauri").join("resources").join("onnx"));
+        candidates.push(cwd.join("resources").join(subdir));
+        candidates.push(cwd.join("src-tauri").join("resources").join(subdir));
         if let Some(root) = cwd.parent() {
-            candidates.push(root.join("src-tauri").join("resources").join("onnx"));
+            candidates.push(root.join("src-tauri").join("resources").join(subdir));
         }
     }
     for candidate in &candidates {
@@ -64,13 +61,24 @@ pub fn resolve_templates() -> Result<PathBuf, String> {
         }
     }
     Err(format!(
-        "没有找到 ONNX 骨架目录，已查找：{}。安装包损坏或不是官方构建。",
+        "没有找到 {subdir} 资源目录，已查找：{}。安装包损坏或不是官方构建。",
         candidates
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>()
             .join("；")
     ))
+}
+
+/// Locate the bundled skeletons, honouring the developer override first.
+pub fn resolve_templates() -> Result<PathBuf, String> {
+    if let Ok(explicit) = std::env::var("MONTGOMERY_ONNX_TEMPLATES") {
+        let path = PathBuf::from(explicit);
+        if path.is_dir() {
+            return Ok(path);
+        }
+    }
+    resolve_resource("onnx")
 }
 
 /// Name the artifact after both its run and its file.

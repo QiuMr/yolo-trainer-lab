@@ -109,6 +109,7 @@ GPU 驱动出问题只会杀掉引擎进程，壳活着并可以提示或重试�
 | `runtime.rs` | 两边共享的状态：设置、引擎句柄、快照、控制服务句柄 | 否 |
 | `control.rs` | 本地 HTTP 服务：路由、鉴权、自描述文档 | 否 |
 | `version.rs` | 版本号（`build.rs` 从 `tauri.conf.json` 注入）+ 数值化版本比较 | 否 |
+| `pretrained.rs` | 预训练权重清单（编译进二进制）、按需下载、sha256 校验、缓存到 `%LOCALAPPDATA%`、发进度事件 | 部分（只用到 `app_local_data_dir` 与事件） |
 | `updater.rs` | 查 GitHub feed、下载验签、发进度事件、拉起 NSIS 安装器 | 是 |
 | `tray.rs` | 托盘图标、显示/隐藏、退出 | 是 |
 | `lib.rs` | `#[tauri::command]` 薄壳、hub 订阅线程、进程生命周期 | 是 |
@@ -123,6 +124,8 @@ GPU 驱动出问题只会杀掉引擎进程，壳活着并可以提示或重试�
 | `get_settings` | 返回**已解析**的视图（引擎绝对路径、产物绝对路径、错误原因） |
 | `save_settings` | 归一化 → 落盘 → 更新内存缓存 → （控制参数变了就重启监听）→ 回显视图 |
 | `app_version` | 返回编译进去的版本号，由 `build.rs` 注入，前端不硬编码 |
+| `pretrained_catalog` | 列出可下载的权重与本地缓存状态，**不联网** |
+| `download_pretrained` | 取一个权重到本地（必要时下载+校验）；下载在独立线程，因为 reqwest blocking 不能在 async 运行时里驱动 |
 | `check_update` | 查 GitHub feed；**永远成功**，网络/解析失败收敛进 `UpdateInfo.error` |
 | `install_update` | 下载 → 验签 → NSIS `/P` 安装；Windows 上成功即退出进程 |
 

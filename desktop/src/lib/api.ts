@@ -269,7 +269,62 @@ export async function exportOnnx(model?: string): Promise<OnnxExport> {
   return await invoke<OnnxExport>("export_onnx", { request: { model: model ?? null } });
 }
 
-export async function scanDataset(path: string): Promise<DatasetSummary> {  if (!isTauri) {
+/**
+ * A pretrained weight the build can fetch.
+ *
+ * The installer ships the *list* only — a few kilobytes of name, size and digest. The file itself
+ * comes from a GitHub Release the first time someone trains with it. Bundling was measured and
+ * rejected: a `.bpk` compresses at 1.11x, so even the nine n-rung weights would have taken the
+ * download from 29 MB to 80 MB, and all fifteen detection models are 374 MB.
+ */
+export type PretrainedWeight = {
+  arch: string;
+  family: string;
+  scale: string;
+  task: string;
+  bytes: number;
+  classes: number;
+  /** What it was pretrained on: `COCO` for detection/segmentation, `ImageNet` for classification. */
+  dataset: string;
+  /** Already on disk — nothing to download. */
+  cached: boolean;
+  path: string | null;
+};
+
+export type PretrainedProgress = {
+  arch: string;
+  phase: "download" | "verify" | "done";
+  received: number;
+  total: number;
+};
+
+export async function pretrainedCatalog(): Promise<PretrainedWeight[]> {
+  if (!isTauri) return [];
+  return await invoke<PretrainedWeight[]>("pretrained_catalog");
+}
+
+/**
+ * Resolve one weight to a local path, downloading it if needed.
+ *
+ * Rejects with a message the user can act on: a blocked network names the file and the exact
+ * directory to drop it in, so the feature still works offline.
+ */
+export async function downloadPretrained(arch: string): Promise<string> {
+  if (!isTauri) throw new Error("当前是界面预览模式，无法下载预训练权重。");
+  return await invoke<string>("download_pretrained", { arch });
+}
+
+export async function onPretrainedProgress(
+  handler: (progress: PretrainedProgress) => void,
+): Promise<UnlistenFn> {
+  if (!isTauri) return () => {};
+  return await listen<PretrainedProgress>("pretrained-progress", (event) =>
+    handler(event.payload),
+  );
+}
+
+export async function scanDataset(path: string): Promise<DatasetSummary> {
+  if (!isTauri) {
     // Preview mode: return a sample so the page can be judged without an engine. The path picks
     // which layout to stand in for — the two render different cards.
     const sample = path.includes("classify")

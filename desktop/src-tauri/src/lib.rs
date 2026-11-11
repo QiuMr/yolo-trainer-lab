@@ -25,13 +25,14 @@
 //! already emit — this layer forwards JSON lines verbatim and only adds lifecycle events (`exit`)
 //! that a process cannot emit about itself.
 
-use tauri::{Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 mod control;
 mod dataset;
 mod engine;
 mod onnx_export;
 mod predict;
+mod pretrained;
 mod runstate;
 mod runtime;
 mod settings;
@@ -147,6 +148,29 @@ fn get_settings(runtime: State<'_, Runtime>) -> Result<SettingsView, String> {
     Ok(runtime.view())
 }
 
+/// Every pretrained weight this build offers, plus whether it is already on disk.
+///
+/// Sync and cheap: it only stats a few files. The window calls it when the train page opens and
+/// after each download so the picker can swap "下载" for "已就绪".
+#[tauri::command]
+fn pretrained_catalog(app: AppHandle) -> Vec<pretrained::WeightView> {
+    pretrained::catalog(&app)
+}
+
+/// Resolve one weight to a local path, downloading it first if needed.
+///
+/// Progress arrives through [`pretrained::PROGRESS_EVENT`]; the returned path goes straight into a
+/// `finetune` training request. The transfer runs on a plain thread because `reqwest`'s blocking
+/// client builds its own runtime and must not be driven from inside the async runtime.
+#[tauri::command]
+async fn download_pretrained(app: AppHandle, arch: String) -> Result<String, String> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(pretrained::ensure(&app, &arch));
+    });
+    receiver.await.map_err(|_| "下载线程异常退出".to_owned())?
+}
+
 #[tauri::command]
 fn save_settings(
     runtime: State<'_, Runtime>,
@@ -188,6 +212,8 @@ pub fn run() {
             export_onnx,
             get_settings,
             save_settings,
+            pretrained_catalog,
+            download_pretrained,
             app_version,
             check_update,
             install_update

@@ -1,0 +1,254 @@
+diff --git a/src/training/events.rs b/src/training/events.rs
+new file mode 100644
+index 0000000..ce33694
+--- /dev/null
++++ b/src/training/events.rs
+@@ -0,0 +1,76 @@
++//! Machine-readable training progress.
++//!
++//! `stdout` carries one JSON object per line so a GUI can stream progress without scraping prose.
++//! `stderr` keeps the human-readable narration. Both are written from the same numbers, so they
++//! cannot disagree — and no field exists only in the prose.
++//!
++//! A consumer should treat unknown `type` values as ignorable and unknown fields as additive: this
++//! is a contract for a GUI we ship, not a stable public API.
++
++use serde::Serialize;
++use std::io::Write;
++
++/// One progress event, tagged by `type` so consumers dispatch on a single field.
++#[derive(Debug, Clone, Serialize)]
++#[serde(tag = "type", rename_all = "snake_case")]
++pub enum TrainEvent {
++    /// Emitted once, after the dataset resolves and before the first batch.
++    Start {
++        /// Directory holding every artifact of this run.
++        run: String,
++        /// `"cpu"` or `"gpu"` — what the run actually executes on, not what was requested.
++        backend: String,
++        /// Adapter description as the runtime reports it.
++        adapter: String,
++        epochs: usize,
++        batch_size: usize,
++        image_size: Option<usize>,
++        class_names: Vec<String>,
++    },
++    /// Emitted after each epoch's training pass completes.
++    Epoch {
++        epoch: usize,
++        epochs: usize,
++        loss: f64,
++        /// Validation fitness when validation ran this epoch, otherwise absent.
++        fitness: Option<f64>,
++        /// Wall-clock seconds for this epoch.
++        elapsed_s: f64,
++    },
++    /// Emitted once, after checkpoints and exports are on disk.
++    End {
++        run: String,
++        best: Option<String>,
++        last: Option<String>,
++    },
++    /// Emitted instead of `End` when the run fails.
++    Error {
++        /// Stable machine identifier; see docs/API.md for the table.
++        code: String,
++        message: String,
++        /// What the user can actually do about it, when we know.
++        hint: Option<String>,
++    },
++}
++
++/// Write one event to `stdout` as a single line and flush immediately.
++///
++/// Flushing matters: a GUI that reads line-by-line must see progress while the run is happening, not
++/// when the process exits and the buffer drains.
++pub fn emit(event: &TrainEvent) {
++    let Ok(line) = serde_json::to_string(event) else {
++        return;
++    };
++    let mut stdout = std::io::stdout();
++    if writeln!(stdout, "{line}").is_ok() {
++        let _ = stdout.flush();
++    }
++}
++
++/// The backend this process was configured to train on.
++///
++/// Read from the environment because that is how the CLI hands the resolved choice to
++/// `default_wgpu_device()`; `"auto"` here means the caller never resolved one.
++pub fn configured_backend() -> String {
++    std::env::var("MONTGOMERY_WGPU_BACKEND").unwrap_or_else(|_| "auto".to_owned())
++}
+diff --git a/src/training/mod.rs b/src/training/mod.rs
+index 6c9e3a5..cf45d37 100644
+--- a/src/training/mod.rs
++++ b/src/training/mod.rs
+@@ -11,6 +11,7 @@ pub mod data;
+ pub mod dispatch;
+ pub mod ema;
+ pub mod engine;
++pub mod events;
+ pub mod geometry;
+ pub mod loss;
+ pub mod metrics;
+diff --git a/src/training/runtime.rs b/src/training/runtime.rs
+index 2902bd6..bb071ed 100644
+--- a/src/training/runtime.rs
++++ b/src/training/runtime.rs
+@@ -12,9 +12,11 @@ use burn::{
+     tensor::Device,
+     tensor::Tensor,
+ };
+-use burn_store::{ModuleSnapshot, PathFilter};
++use burn_store::{ApplyError, ModuleSnapshot, PathFilter};
+ use serde::{Deserialize, Serialize};
+ 
++use crate::training::events::{self, TrainEvent};
++
+ use crate::{
+     ModelId,
+     data::augmentation::{
+@@ -777,6 +779,20 @@ impl ReplacedProjection {
+     fn is_replaced(self, path: &str) -> bool {
+         !(self.filter())(path, "")
+     }
++
++    /// Whether this head can legitimately have a classification tower whose width differs from
++    /// the checkpoint's. Only the `Detect`-based heads can: their width is
++    /// `max(ch[0], min(nc, 100))`, which tracks the class count whenever `ch[0] <= 100`.
++    fn tolerates_tower_resize(self) -> bool {
++        match self {
++            Self::Detector | Self::Yolo26Segment => true,
++            // `head.linear` is a single projection, so there is no tower to resize.
++            Self::Classifier => false,
++            // Not part of the product's catalog, and their class branches are named differently —
++            // `is_class_tower` never matches them, so a tower mismatch would be a real fault.
++            Self::Yolox | Self::Yolov3 => false,
++        }
++    }
+ }
+ 
+ fn keep_without_classifier(path: &str, _container: &str) -> bool {
+@@ -799,6 +815,22 @@ fn keep_without_yolo26_segment_classes(path: &str, container: &str) -> bool {
+     keep_without_detector_classes(path, container) && !path.starts_with("head.proto.sem_out.")
+ }
+ 
++/// Whether `path` names one of the two convolutions that make up a `Detect` classification tower.
++///
++/// The tower width is `max(ch[0], min(nc, 100))`. Only the `n` rung has `ch[0] <= 100` (64), so
++/// only there does the width follow the class count: an 80-class checkpoint has an 80-wide tower,
++/// a 3-class model a 64-wide one. The two 3x3 convolutions therefore cannot be copied across that
++/// boundary, and Ultralytics drops the mismatched keys in exactly the same place
++/// (`intersect_dicts`). The projection that follows them (`cls_out`) is already excluded by the
++/// projection filter; this function only has to cover the tower body.
++///
++/// Matched by module segment rather than by substring so that YOLOX's `head.cls_preds.N` — whose
++/// per-scale index is a bare number — is not swept in by accident.
++fn is_class_tower(path: &str) -> bool {
++    const TOWER: [&str; 6] = ["cls_0", "cls_1", "cls_dw_0", "cls_pw_0", "cls_dw_1", "cls_pw_1"];
++    path.split('.').any(|segment| TOWER.contains(&segment))
++}
++
+ fn transfer_pretrained<M>(
+     mut target: M,
+     official: &M,
+@@ -808,12 +840,27 @@ where
+     M: Module,
+ {
+     let snapshots = official.collect(None, None, false);
+-    let result = target.apply(
++    let mut result = target.apply(
+         snapshots,
+         Some(PathFilter::new().with_predicate(projection.filter())),
+         None,
+         false,
+     );
++
++    // Shape mismatches inside the classification tower are expected, not a fault: they are what
++    // the `n` rung looks like when the class count crosses `ch[0]`. Burn leaves those parameters
++    // at their fresh initialization and reports them as errors, so they are reclassified as
++    // "freshly initialized" here. Everything else stays fatal — a wrong-architecture artifact
++    // mismatches body tensors too, and must not load as a silently half-random model.
++    let (tower, fatal): (Vec<ApplyError>, Vec<ApplyError>) = result
++        .errors
++        .drain(..)
++        .partition(|error| match error {
++            ApplyError::ShapeMismatch { path, .. } => is_class_tower(path),
++            _ => false,
++        });
++    result.errors = fatal;
++
+     if !result.errors.is_empty() || !result.missing.is_empty() || !result.unused.is_empty() {
+         return Err(format!(
+             "pretrained transfer differed outside the documented class projections:\n{result}"
+@@ -831,10 +878,25 @@ where
+         )
+         .into());
+     }
++    if !tower.is_empty() && !projection.tolerates_tower_resize() {
++        return Err(format!(
++            "pretrained transfer resized the classification tower of a {}-class projection:\n{result}",
++            projection.official_classes()
++        )
++        .into());
++    }
+     eprintln!(
+-        "Initialized {} tensors from pretrained weights; freshly initialized {} class-projection tensors",
++        "Initialized {} tensors from pretrained weights; freshly initialized {} class-projection tensors{}",
+         result.applied.len(),
+-        result.skipped.len()
++        result.skipped.len(),
++        if tower.is_empty() {
++            String::new()
++        } else {
++            format!(
++                " and {} classification-tower tensors (width follows the class count at this scale)",
++                tower.len()
++            )
++        }
+     );
+     Ok(target)
+ }
+@@ -1028,6 +1090,17 @@ fn train_inner(
+         trainer.run.write_environment(&adapter, &dataset)?;
+         trainer
+     };
++    // Machine-readable start marker. A GUI needs the resolved backend and the run directory before
++    // it can render anything, and neither is discoverable from the prose log.
++    events::emit(&TrainEvent::Start {
++        run: trainer.run.root.display().to_string(),
++        backend: events::configured_backend(),
++        adapter: adapter.clone(),
++        epochs: request.epochs,
++        batch_size: config.batch_size,
++        image_size: request.image_size,
++        class_names: dataset.class_names.clone(),
++    });
+     let classes = config.model.num_classes;
+     let model_id = config.model.architecture;
+ 
+@@ -1869,6 +1942,7 @@ where
+     }
+     let mut pending_checkpoint: Option<PendingCheckpoint> = None;
+     while trainer.state.epoch < trainer.config.epochs {
++        let epoch_started = Instant::now();
+         let result = trainer.train_epoch(
+             model,
+             optimizer,
+@@ -2015,6 +2089,15 @@ where
+                 trainer.state.epoch, result.2.mean_loss
+             );
+         }
++        events::emit(&TrainEvent::Epoch {
++            epoch: trainer.state.epoch,
++            epochs: trainer.config.epochs,
++            loss: result.2.mean_loss as f64,
++            fitness: validation
++                .as_ref()
++                .map(|summary| validation_fitness(summary) as f64),
++            elapsed_s: epoch_started.elapsed().as_secs_f64(),
++        });
+         if stopping {
+             eprintln!(
+                 "early stopping after {} validation epochs without improvement",
