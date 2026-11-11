@@ -497,3 +497,76 @@ URL、核对、补传统一用它；文件内容不变，签名仍然有效。
 
 **遗留**：完整 UI 链路（点按钮 → 自动装完 → 自动重启）仍需在**正常交互式桌面**人工点一次；
 agent 会话只能验证到"拉起安装器"，最后一步用等价参数的手动运行验证。
+
+---
+
+## D025 · 续训入口与 ONNX 导出：能力已查清，暂不实现
+
+**决定**：本轮**不做**。两项都不是技术障碍，是产品决策，需要先定方案再动手。这份记录的目的是
+下次讨论时不用重新翻上游源码。
+
+### 产品里其实有三种"模型"，语义不能混
+
+实测来自 `artifacts/classify-runs/classify/train-1794327695-00006964`（分类小模型）：
+
+| 路径 | 实测体积 | 内容 | 能干什么 |
+| --- | --- | --- | --- |
+| `exports/best.bpk` / `last.bpk` | 3.16 MB | 权重 + 架构元数据 | 推理（`predict --model`）；**当预训练权重用** |
+| `checkpoints/best` / `last` | 24 MB | `model.bin` + `ema.bin` + `optimizer.bin` + `manifest.json` | **断点续训** |
+| 导出的 `.safetensors` / `.onnx` | — | 中间产物 / 部署格式 | 只有导出时才产生 |
+
+体积差 7 倍几乎全在 AdamW 的两个动量状态。`.bpk` 的 metadata 自带架构，所以
+`train --model xxx.bpk` **不需要**再传 `--architecture`。
+
+### 续训：引擎支持两种，壳层一个都没接
+
+```console
+train --architecture yolo26n   # 从零
+train --model best.bpk         # 微调：新 run，优化器状态重置，只借权重
+train --resume checkpoints/last # 断点续训：epoch 计数 / 优化器 / EMA / 数据集配置全继承
+```
+
+上游 README 原话：**"A Burnpack initializes a new run; it is not a resumable optimizer checkpoint."**
+—— 想接着上次进度必须用 `--resume`，用 `.bpk` 会静默丢掉优化器动量和已训 epoch，这是最容易
+做错的一处。
+
+现状：`desktop/src-tauri/src/engine.rs` 的 spawn 只拼 `--architecture` + `--data`，
+`TrainRequest` 也没有对应字段。**纯 UI 缺口，`TrainRequest` 要加初始化方式并同步 `docs/API.md`。**
+
+### ONNX：不是"要装 Python"，是"图只能由 Python 搭"
+
+`src/export/mod.rs` 模块注释（原文）：
+
+> Burn does not export these ONNX graphs directly. This module therefore loads the requested model
+> in Rust, snapshots its parameters to SafeTensors, and launches the pinned repository-owned Python
+> graph adapter.
+
+拆开看：**权重命名映射已经在 Rust 里做完了**（`src/export/keymap.rs` 是 importer 的逆向规则，
+`burn_store::BurnToPyTorchAdapter` 负责 SafeTensors 交接）。Python 只承担剩下那一件事——按
+ultralytics 源码重建计算图并 `torch.onnx.export`。因为 Burn 本身没有 ONNX 导出能力。
+
+环境需求（`tools/onnx/requirements.lock.txt`）：Python 3.11~3.14、`torch==2.13.0`（单包下载约
+200 MB、解压近 1 GB）、`onnx` / `onnxruntime` / `safetensors` / `numpy`，外加**一份姊妹目录的
+ultralytics 源码**（不是 pip wheel），YOLOX 还需官方 `0.1.1rc0` checkout。
+`--no-verify` 只跳过 Burn-vs-PyTorch 数值对比，**ONNX Runtime 校验永远必跑**。
+
+→ 与"几十 MB、零环境"的产品前提直接冲突，客户端调这个命令的方案不可行。
+
+### 三条候选路线（都评估过，未采纳）
+
+1. **骨架 + 填权重**（真免环境，估 3~5 天）
+   原理：图结构与权重正交，同一架构的图永远一样。我们侧装 Python 用真实权重导一次图 →
+   权重清零保留 name/shape/dtype 得到骨架（每个几百 KB）→ 客户端读 `.bpk` 按 keymap 填进去。
+   更省的实现：骨架用 `--external-data always` 导出，权重外置成 `weights.bin`，客户端只需按
+   offset 写字节，**连 protobuf 都不用解析**。
+   风险：骨架随上游图结构漂移需重生成（要跟 export spec 版本走）；5 任务 × 6 family × 3 profile
+   的矩阵要用 `--dynamic-spatial` 压（但要确认下游 runtime 支持动态 shape）；`end2end` 把 NMS
+   阈值烤进图里，阈值一改就得重导；`portable` 只出 raw head，下游得自己写 NMS。
+2. **联网转换**（1~2 天）：客户端上传 `.bpk`，服务器跑现成 export 回传 `.onnx`。代价是服务器、
+   依赖联网、权重出本机。
+3. **只导 SafeTensors**（半天）：权重 + 元数据 JSON，Python 下游可用；C++/OpenCV/TensorRT 仍无解。
+
+### 重新评估的触发条件
+
+出现"模型要部署到没有训练器的环境"的真实需求时再做。优先选 1（符合免环境理念），
+需求急且能接受联网时先用 2 过渡。
