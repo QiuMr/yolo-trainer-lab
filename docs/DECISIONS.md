@@ -602,34 +602,59 @@ Python 侧却用它建图（`classes = int(manifest["num_classes"])`），所以
 读真实类别数覆盖 spec（仅对 detect/segment/classify）。实测输出
 `Overriding model.yaml nc=1000 with nc=3`，3 类分类模型导出成功（6.17 MB，ORT 校验通过）。
 
-### 阻塞 1：检测头的隐藏通道下限不一致（可修，但代价大）
+### 阻塞 1（已解决）：检测头的隐藏通道下限被写成了常量
 
 yolov8n（3 类）导出失败：**0 missing / 0 unexpected / 33 wrong-shape**，全部集中在
 `model.22.cv3.*`（分类分支的所有张量，3 尺度 × 11）。
 
-根因是两边算隐藏通道的公式不同：
+根因不是"两边公式不同"，而是**一行笔误**。`head.rs` 的注释自己写着 Ultralytics 的规则是
+`max(ch[0], min(nc, 100))`，代码却写成 `p3_channels.max(DEFAULT_NUM_CLASSES.min(100))` ——
+把 `nc` 写成了常量 80。更关键的是 `with_num_classes` 只改 `num_classes`、**不重算
+`cls_channels`**，所以通道宽度在构造时就按 80 定死了：
 
-| | 公式 | p3=64 时 |
+| | 实际值 | p3=64, nc=3 |
 | --- | --- | --- |
-| montgomery `head.rs` | `p3_channels.max(DEFAULT_NUM_CLASSES.min(100))` | max(64, 80) = **80** |
-| ultralytics | `max(16, ch // 4, reg_max * 4)` | max(16, 16, 64) = **64** |
+| 修复前 | `max(64, 80)` | **80** |
+| Ultralytics | `max(64, min(3,100))` | **64** |
 
-所以整个 cv3 分支通道数不同（80 vs 64），与 nc 无关。**只有 COCO 80 类这种"恰好相等"的情况
-能导出**——上游显然只在 COCO 上验证过这条路径。
+后果：训练完全正常（多余通道闲置），只有导出时才暴露。**只有 nc ≥ 80 的模型能导出**——
+上游显然只在 COCO 上验证过这条路径。
 
-修法：把各 `head.rs` 的 `cls_channels` 改成与 ultralytics 一致。
-**代价：改变模型结构，所有已训 checkpoint 全部不兼容，需要重训。** 需用户拍板。
+修复：`with_num_classes` 里同步重算 `self.cls_channels = self.p3_channels.max(num_classes.min(100))`，
+改 `yolov8` / `yolo11` / `yolo26` / `yolov10` 四个 head（`yolo12` 复用 yolo11 的 head，自动覆盖）。
+**代价：改变模型结构，此前训的 checkpoint 不兼容，需要重训。**
 
-### 阻塞 2：yolo26 系列结构不同（更难）
+### 阻塞 2（已解决）：yolo26 的辅助头被写进了导出快照
 
-yolo26n（3 类）导出失败：**102 unexpected + 48 wrong-shape**。
+yolo26n 修完通道后从 `48 wrong-shape` 变成 **0 wrong-shape，102 unexpected**，且全部是
+`head.o2m_p3/p4/p5`。
 
-- unexpected 全部是 `head.o2m_p3/p4/p5`（one-to-many 头，每层 34 个）
-- wrong-shape 全部是 `model.23.one2one_cv3`（one-to-one 头）
+确认推理不需要它们：`Yolo26::forward()` 只调 `head.forward(...)`（one2one 单头），
+`forward_train_dual` 才是 `head.o2m_*` 的唯一使用者 —— o2m 是训练辅助头，任何推理图都不可能消费它。
 
-即 montgomery 的 yolo26 是 **o2m + one2one 双头**实现，而 ultralytics 461196c 的 `yolo26n.yaml`
-只有 one2one。这不是 keymap 能补的，是架构级差异。yolo26 是我们的默认推荐架构，所以这一条
-直接决定 ONNX 功能的覆盖面。
+修复：`snapshot.rs` 里给 `SafetensorsStore` 加
+`.filter(PathFilter::new().with_predicate(|path, _| !path.contains("o2m_")))`。
+注意 `PathFilter` 默认 `new()` 是"不匹配任何路径"，且 `match_all` 状态下谓词会被忽略，
+所以必须显式构造新 filter 而不是在默认上追加谓词。
+
+**没有**选择"让 Python 审计忽略这个前缀"：那等于改测试来迁就产物，而"推理图不含辅助头"是
+语义上正确的事，应该在产物生成时就做对。
+
+### 实测结果（三种模型全部通过）
+
+| 模型 | 导出 | 体积 | 骨架等价性 |
+| --- | --- | --- | --- |
+| 分类 3 类（yolo26n-cls） | ✅ ORT 校验通过 | 6.17 MB | ✅ max\|diff\| = 0 |
+| 检测 3 类（yolov8n） | ✅ ORT 校验通过 | 11.7 MB | ✅ max\|diff\| = 0 |
+| 检测 3 类（yolo26n） | ✅ ORT 校验通过 | 9.77 MB | ✅ max\|diff\| = 0 |
+
+骨架规模：分类 202 节点 / 80 张量；yolov8 375 节点 / 127 张量；yolo26 514 节点 / 204 张量。
+
+三份补丁在 `patches/`（`research/` 不入库，不留补丁下次构建出来的 exe 行为会不同）：
+
+1. `0001-export-read-num-classes-from-checkpoint.patch` —— 类别数读模型而非常量
+2. `0002-head-classification-tower-width.patch` —— 分类塔宽度按 nc 重算
+3. `0003-drop-yolo26-auxiliary-head.patch` —— 导出时丢弃 o2m 辅助头
 
 ### 环境侧的坑（只影响我们复现，不影响产品）
 

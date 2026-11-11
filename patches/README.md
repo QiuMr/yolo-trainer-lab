@@ -16,6 +16,28 @@ cargo build --release --features training,onnx
 **注意 `--features training,onnx`**：默认 feature 是 `["pretrained", "onnx"]`，不含 `training`，
 而 `main.rs` 里有只在 `training` 下编译的调用，默认构建会直接编译失败。
 
+## 0002 · 分类塔宽度按真实类别数重算
+
+`head.rs` 的注释写着 Ultralytics 的规则是 `max(ch[0], min(nc, 100))`，代码却写成
+`p3_channels.max(DEFAULT_NUM_CLASSES.min(100))`——把 `nc` 写成了常量 80。而
+`with_num_classes` 只改 `num_classes`、不重算 `cls_channels`，宽度在构造时就定死了。
+
+后果：训练完全正常（多余通道闲置），只有导出时才暴露成 33 个 wrong-shape 张量，
+且**只有 nc ≥ 80 的模型能导出**。改 yolov8 / yolo11 / yolo26 / yolov10 四个 head
+（yolo12 复用 yolo11 的 head）。
+
+**这个补丁改变模型结构，此前训的 checkpoint 不兼容。**
+
+## 0003 · 导出时丢弃 yolo26 的辅助头
+
+yolo26 的 `head.o2m_*` 是训练辅助头：`forward()` 只走 one2one 单头，只有
+`forward_train_dual` 用它。写进快照会让审计报 102 个 unexpected 并中止导出，
+而任何推理图都不可能消费它们。
+
+用 `.filter(PathFilter::new().with_predicate(|path,_| !path.contains("o2m_")))` 剔除。
+注意 `PathFilter::new()` 是"不匹配任何路径"，`match_all` 状态下谓词会被忽略，
+必须显式构造新 filter。
+
 ## 0001 · 导出时从模型读真实类别数
 
 `ExportSpec::for_model` 的 `num_classes` 是写死的（分类 1000 / 语义 19 / 深度 1 / 其余 80），
