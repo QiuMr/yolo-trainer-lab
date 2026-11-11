@@ -31,8 +31,13 @@ montgomery train --architecture <MODEL> --data <dataset.yaml> [options]
 | 参数 | 含义 |
 | --- | --- |
 | `--architecture yolo26n` | 从零初始化（推荐给终端用户，无需预训练权重） |
-| `--model <x.bpk>` | 从预训练权重初始化 |
-| `--resume <checkpoint>` | 断点续训（数据集与模型从 checkpoint 读取） |
+| `--model <x.bpk>` | 从预训练权重初始化（**新 run**，优化器/EMA/轮数重来） |
+| `--resume <checkpoint>` | 断点续训（数据集、批大小、轮数都从 checkpoint 读取） |
+
+`--resume` 的两个坑（都实测过）：**不能同时传 `--data`**（clap 直接冲突报错）；
+`--epochs` 不改变真实预算，但会改变 `start` 事件里上报的 `epochs` —— 上游 `train_inner` 用
+checkpoint 的 `config.epochs` 训练，却拿 `request.epochs` 发事件，不传就是 clap 默认的 100。
+壳层因此会在续训时主动传入 checkpoint 自己的轮数（见 `engine.rs::read_checkpoint`）。
 
 | 参数 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -315,15 +320,41 @@ montgomery __device-probe --device gpu|cpu
 
 ### 9.4 `POST /train`
 
+**从零开始**（原有格式，继续支持）：
+
 ```jsonc
 {"dataset":"E:/data/coco-mini","epochs":20,"batch":4,"device":"auto"}
 ```
 
-只有 `dataset` 必填，其余默认 `architecture=yolo26n`、`epochs=1`、`batch=8`、
-`device=<设置里的默认设备>`。`dataset` 可以是含 `dataset.yaml` 的目录，也可以是 yaml 本身。
+**从已有模型微调** / **断点续训**（新格式）：
+
+```jsonc
+{"init":{"mode":"finetune","model":"E:/runs/train-1/exports/best.bpk"},"dataset":"E:/data/new","epochs":30}
+{"init":{"mode":"resume","checkpoint":"E:/runs/train-1/checkpoints/last"}}
+```
+
+| `init.mode` | 必填字段 | 语义 |
+| --- | --- | --- |
+| `scratch` | `architecture` | 随机初始化 |
+| `finetune` | `model`（`.bpk`）+ `dataset` | 借权重，**新 run**：优化器 / EMA / 轮数全部重来 |
+| `resume` | `checkpoint`（`checkpoints/last` 目录） | 接着上次跑：轮数、优化器状态、数据集全部来自检查点 |
+
+`finetune` 与 `resume` **不能混用**，这是最容易做错的一处：上游原话是
+"A Burnpack initializes a new run; it is not a resumable optimizer checkpoint"。
+拿 `.bpk` 当续训用，程序会正常跑，但进度已经清零。
+
+`resume` 不要传 `dataset`（上传了也会被忽略，引擎自身也拒绝 `--data` + `--resume`），
+同样不要指望 `epochs` / `batch` / `imgsz` 生效——它们由检查点决定。`checkpoint` 目录必须含
+`manifest.json`、`model.bin`、`optimizer.bin`。
+
+不传 `init` 时按 `{"mode":"scratch","architecture":"yolo26n"}` 处理，其余默认
+`epochs=1`、`batch=8`、`device=<设置里的默认设备>`。`dataset` 可以是含 `dataset.yaml` 的目录，
+也可以是 yaml 本身。
 
 ```json
-{"ok":true,"accepted":{"architecture":"yolo26n","epochs":20,"batch":4,"imgsz":null,"device":"auto"},
+{"ok":true,
+ "accepted":{"init":{"mode":"scratch","architecture":"yolo26n"},"dataset":"E:/data/coco-mini",
+             "epochs":20,"batch":4,"imgsz":null,"device":"auto"},
  "note":"已开始。轮询 GET /state 或 GET /events?since=<cursor> 获取进度。"}
 ```
 

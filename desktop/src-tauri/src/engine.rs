@@ -32,16 +32,55 @@ pub(crate) fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// How a run starts.
+///
+/// `montgomery train` accepts **exactly one** of `--architecture` / `--model` / `--resume` and clap
+/// rejects any combination, so this is modelled as a choice. Three optional strings that can
+/// disagree would push that rule onto every caller and leave the failure to clap's error text.
+///
+/// The distinction between the last two is the one people get wrong, and it is not cosmetic:
+/// upstream's README says *"A Burnpack initializes a new run; it is not a resumable optimizer
+/// checkpoint."* Finetune silently restarts the optimizer, EMA and epoch counter; only Resume
+/// continues them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum TrainInit {
+    /// Random weights from a named architecture.
+    Scratch { architecture: String },
+    /// Start from a finished `.bpk`. A new run: optimizer/EMA/epoch restart. Use when the goal is
+    /// "keep what it learned, teach it my data".
+    Finetune { model: String },
+    /// Continue an interrupted run exactly. The checkpoint owns the dataset path, batch size and
+    /// epoch budget — those must not be passed, and are ignored if they are.
+    Resume { checkpoint: String },
+}
+
 /// What the shell may ask the engine to do. Mirrors the subset of `montgomery train` the UI drives.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainRequest {
-    pub architecture: String,
+    pub init: TrainInit,
+    /// Dataset manifest for `scratch` and `finetune`. Empty and unused for `resume`.
+    #[serde(default)]
     pub dataset: String,
     pub epochs: u32,
     pub batch: u32,
     pub imgsz: Option<u32>,
     /// `auto` | `cpu` | `gpu`. Anything else is coerced to `auto` before it reaches clap.
     pub device: String,
+}
+
+/// The parts of a training checkpoint that live in its `manifest.json`.
+///
+/// Read on the shell side only because of an upstream quirk: `train_inner` keeps the epoch budget
+/// from the checkpoint but emits the `start` event with `request.epochs`, which is clap's default
+/// of 100 when the caller passed nothing. A 300-epoch run resumed without `--epochs` would therefore
+/// report "0/100" while actually training to 300. Passing the checkpoint's own numbers makes the
+/// event honest again, and they are otherwise ignored by the resume path.
+struct ResumeInfo {
+    dir: PathBuf,
+    epochs: u32,
+    batch: u32,
+    dataset: String,
 }
 
 impl TrainRequest {
@@ -56,6 +95,95 @@ impl TrainRequest {
             "auto".to_owned()
         }
     }
+}
+
+/// Accept either a dataset directory or a manifest file, and insist the result exists.
+///
+/// The engine would ultimately fail on a bad path too, but twenty seconds later and with its own
+/// wording; this is the same check the UI already made, repeated where an HTTP caller can reach it.
+fn resolve_manifest(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("缺少数据集路径。".into());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.exists() {
+        return Err(format!("数据集路径不存在：{trimmed}"));
+    }
+    if path.is_dir() {
+        let manifest = path.join("dataset.yaml");
+        if !manifest.is_file() {
+            return Err(format!("目录里没有 dataset.yaml：{trimmed}"));
+        }
+        return Ok(manifest);
+    }
+    Ok(path)
+}
+
+/// Read `<checkpoint>/manifest.json` and verify the files the engine will actually need.
+fn read_checkpoint(raw: &str) -> Result<ResumeInfo, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("缺少 checkpoint 目录。".into());
+    }
+    let dir = PathBuf::from(trimmed);
+    if !dir.is_dir() {
+        return Err(format!(
+            "checkpoint 目录不存在：{trimmed}（应指向 runs/<name>/checkpoints/last）"
+        ));
+    }
+    for required in ["manifest.json", "model.bin", "optimizer.bin"] {
+        if !dir.join(required).is_file() {
+            return Err(format!(
+                "checkpoint 不完整，缺少 {required}：{trimmed}。\
+                 应指向 runs/<name>/checkpoints/last，不是 exports/ 里的 .bpk。"
+            ));
+        }
+    }
+    let bytes = std::fs::read(dir.join("manifest.json"))
+        .map_err(|error| format!("读取 checkpoint 清单失败：{error}"))?;
+    let manifest: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("checkpoint 清单不是合法 JSON：{error}"))?;
+    let config = manifest
+        .get("config")
+        .ok_or("checkpoint 清单缺少 config 段")?;
+
+    let epochs = config
+        .get("epochs")
+        .and_then(Value::as_u64)
+        .unwrap_or(100) as u32;
+    let batch = config
+        .get("batch_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(8) as u32;
+    let dataset = config
+        .get("data")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+
+    // The checkpoint stores the dataset path verbatim, and the engine resolves it against the
+    // child's working directory — which for a packaged app is the install folder. A relative path
+    // recorded by a CLI run in the repository root therefore cannot resolve here. Saying so now
+    // beats letting the engine die with "No such file" halfway through startup.
+    if dataset.is_empty() {
+        return Err("checkpoint 清单里没有数据集路径（config.data）。".into());
+    }
+    let data_path = PathBuf::from(&dataset);
+    if !data_path.exists() {
+        return Err(format!(
+            "checkpoint 记录的数据集已不存在：{dataset}。\
+             如果是相对路径，它按引擎的工作目录解析，续训要求该路径仍可用；\
+             否则请改用「用已有模型微调」。"
+        ));
+    }
+
+    Ok(ResumeInfo {
+        dir,
+        epochs,
+        batch,
+        dataset,
+    })
 }
 
 /// Candidate locations for `montgomery.exe`, most specific first.
@@ -197,24 +325,63 @@ impl Engine {
             }
         }
 
-        let data_path = PathBuf::from(&request.dataset);
-        let manifest = if data_path.is_dir() {
-            data_path.join("dataset.yaml")
-        } else {
-            data_path
-        };
-
         let mut command = hidden_command(exe);
+        command.arg("train");
+        // Everything mode-specific is decided here, before a process exists, so a bad path is a
+        // readable message rather than an engine that starts and dies on its own.
+        match &request.init {
+            TrainInit::Scratch { architecture } => {
+                let manifest = resolve_manifest(&request.dataset)?;
+                command
+                    .arg("--architecture")
+                    .arg(architecture)
+                    .arg("--data")
+                    .arg(&manifest)
+                    .arg("--epochs")
+                    .arg(request.epochs.to_string())
+                    .arg("--batch")
+                    .arg(request.batch.to_string());
+            }
+            TrainInit::Finetune { model } => {
+                let manifest = resolve_manifest(&request.dataset)?;
+                let model_path = PathBuf::from(model.trim());
+                if !model_path.is_file() {
+                    return Err(format!("模型文件不存在：{}", model_path.display()));
+                }
+                command
+                    .arg("--model")
+                    .arg(&model_path)
+                    .arg("--data")
+                    .arg(&manifest)
+                    .arg("--epochs")
+                    .arg(request.epochs.to_string())
+                    .arg("--batch")
+                    .arg(request.batch.to_string());
+            }
+            TrainInit::Resume { checkpoint } => {
+                let info = read_checkpoint(checkpoint)?;
+                // Only the checkpoint's own numbers: the dataset, batch and epoch budget all come
+                // from it. Passing them makes the start event report the real epoch budget (see
+                // `ResumeInfo`) and keeps the engine from re-deriving anything.
+                command
+                    .arg("--resume")
+                    .arg(&info.dir)
+                    .arg("--epochs")
+                    .arg(info.epochs.to_string())
+                    .arg("--batch")
+                    .arg(info.batch.to_string());
+                // Surface what is being continued. The UI cannot read the checkpoint itself, and an
+                // assistant watching the log should see which dataset is about to be walked and how
+                // many epochs it is signing up for.
+                self.0.hub.publish(Message::Log(format!(
+                    "续训：从 {} 恢复 · 数据集 {} · 计划 {} 轮",
+                    info.dir.display(),
+                    info.dataset,
+                    info.epochs
+                )));
+            }
+        }
         command
-            .arg("train")
-            .arg("--architecture")
-            .arg(&request.architecture)
-            .arg("--data")
-            .arg(&manifest)
-            .arg("--epochs")
-            .arg(request.epochs.to_string())
-            .arg("--batch")
-            .arg(request.batch.to_string())
             .arg("--device")
             .arg(request.device(default_device))
             // Without this the engine writes `runs/` into the current directory, which in a
@@ -224,8 +391,12 @@ impl Engine {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
+        // Resume restores the input size from the checkpoint's model spec, so a value here would be
+        // ignored; leaving it out keeps the shell from implying it has an effect.
         if let Some(size) = request.imgsz {
-            command.arg("--imgsz").arg(size.to_string());
+            if !matches!(request.init, TrainInit::Resume { .. }) {
+                command.arg("--imgsz").arg(size.to_string());
+            }
         }
 
         let mut child = command
@@ -330,7 +501,9 @@ mod tests {
 
     fn request(device: &str) -> TrainRequest {
         TrainRequest {
-            architecture: "yolo26n".into(),
+            init: TrainInit::Scratch {
+                architecture: "yolo26n".into(),
+            },
             dataset: "data.yaml".into(),
             epochs: 1,
             batch: 1,
@@ -399,7 +572,9 @@ mod tests {
         let receiver = engine.subscribe();
         let output = std::env::temp_dir().join("yolo-engine-smoke");
         let request = TrainRequest {
-            architecture: "yolo26n".into(),
+            init: TrainInit::Scratch {
+                architecture: "yolo26n".into(),
+            },
             dataset: dataset.to_string_lossy().into_owned(),
             epochs: 1,
             batch: 2,

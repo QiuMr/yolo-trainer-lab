@@ -1,11 +1,14 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
   Boxes,
+  CopyPlus,
   Cpu,
   FolderOpen,
   Gauge,
+  History,
   Layers,
   Play,
+  Plus,
   Sparkles,
   TriangleAlert,
   Wand2,
@@ -13,7 +16,12 @@ import {
 } from "lucide-react";
 import { Button, Card, SectionTitle, cx } from "../components/ui";
 import NumberField from "../components/NumberField";
-import { startTraining } from "../lib/api";
+import {
+  pickFolder,
+  pickModelFile,
+  startTraining,
+  type TrainInit,
+} from "../lib/api";
 import {
   DEFAULT_FAMILY,
   DEFAULT_SCALE,
@@ -30,6 +38,42 @@ const DEVICES = [
   { id: "gpu", label: "GPU", icon: Zap, note: "强制使用显卡" },
   { id: "cpu", label: "CPU", icon: Cpu, note: "兼容性最好，速度最慢" },
 ] as const;
+
+/**
+ * Where the weights come from.
+ *
+ * `finetune` and `resume` look similar in a menu and are not: a `.bpk` starts a **new** run with a
+ * fresh optimizer, while a checkpoint continues the old one. The notes below are the only thing
+ * standing between those two meanings, so they say what is kept rather than naming the files.
+ */
+const INIT_MODES = [
+  {
+    id: "scratch" as const,
+    label: "从零开始",
+    icon: Plus,
+    note: "随机初始化，不用预训练权重",
+  },
+  {
+    id: "finetune" as const,
+    label: "用已有模型",
+    icon: CopyPlus,
+    note: "借它的权重，优化器重新开始",
+  },
+  {
+    id: "resume" as const,
+    label: "继续上次训练",
+    icon: History,
+    note: "连轮数、优化器状态一起接着跑",
+  },
+];
+
+type InitMode = (typeof INIT_MODES)[number]["id"];
+
+/** Last few path segments, for showing a checkpoint without a full 90-character path. */
+function tailPath(path: string, segments = 2): string {
+  const parts = path.split(/[\\/]+/).filter(Boolean);
+  return parts.slice(-segments).join("/");
+}
 
 /** One labelled row inside the model card. The label is a caption, not a heading — it should
  *  read as a dimension of the same choice, which is why it is small and uppercase rather than
@@ -75,6 +119,11 @@ export default function TrainPage({
   const [taskId, setTaskId] = useState<TaskId>(DEFAULT_TASK);
   const [familyKey, setFamilyKey] = useState(DEFAULT_FAMILY);
   const [scaleId, setScaleId] = useState(DEFAULT_SCALE);
+  const [initMode, setInitMode] = useState<InitMode>("scratch");
+  /** Finetune source: a finished `.bpk`. */
+  const [modelPath, setModelPath] = useState<string | null>(null);
+  /** Resume source: a `checkpoints/last` directory, not a `.bpk`. */
+  const [checkpointPath, setCheckpointPath] = useState<string | null>(null);
   const [device, setDevice] = useState<string>(defaultDevice);
   const [epochs, setEpochs] = useState("100");
   const [batch, setBatch] = useState("8");
@@ -118,24 +167,52 @@ export default function TrainPage({
     imgszN <= 2048 &&
     imgszN % 32 === 0;
 
-  const ready = Boolean(dataset) && paramsValid && !running && problem === null;
+  const ready =
+    !running &&
+    (initMode === "scratch"
+      ? Boolean(dataset) && paramsValid && problem === null
+      : initMode === "finetune"
+        ? Boolean(dataset) && paramsValid && Boolean(modelPath)
+        : // Resume needs neither a dataset nor parameters: the checkpoint carries all three of
+          // dataset, batch size and epoch budget.
+          Boolean(checkpointPath));
+
+  /** What the user still has to do, or null when nothing is missing. Drives the action bar; keeps
+   *  the three modes from each needing their own copy of "have I got everything". */
+  const missing =
+    initMode === "resume"
+      ? checkpointPath
+        ? null
+        : "选一个训练检查点"
+      : !dataset
+        ? "选一个数据集"
+        : initMode === "finetune" && !modelPath
+          ? "选一个已有模型"
+          : null;
 
   async function start() {
     // `ready` already gates the button; repeating the check keeps any other caller of start() from
     // launching a combination the scanner described as incompatible.
-    if (!dataset || !paramsValid || problem !== null) return;
+    if (!ready) return;
+    const init: TrainInit =
+      initMode === "scratch"
+        ? { mode: "scratch", architecture: model }
+        : initMode === "finetune" && modelPath
+          ? { mode: "finetune", model: modelPath }
+          : { mode: "resume", checkpoint: checkpointPath ?? "" };
     setStarting(true);
     setError(null);
     try {
       resetRun();
       setState({ status: "running" });
       await startTraining({
-        architecture: model,
-        // The manifest, not the data root: `path:` may point elsewhere and training needs the yaml.
-        dataset: dataset.manifest,
+        init,
+        // Resume reads its dataset from the checkpoint; sending one would be ignored at best and
+        // misleading at worst (the engine rejects `--data` alongside `--resume`).
+        dataset: initMode === "resume" ? "" : (dataset?.manifest ?? ""),
         epochs: epochsN,
         batch: batchN,
-        imgsz: imgszN,
+        imgsz: initMode === "resume" ? null : imgszN,
         device,
       });
       onStarted();
@@ -152,17 +229,58 @@ export default function TrainPage({
     <div>
       <h1 className="text-[26px] font-extrabold tracking-tight">训练</h1>
       <p className="mt-2 text-[14px] font-medium text-ink-soft">
-        从零训练一个视觉模型，不需要预训练权重。
+        从零训练，或者接着之前的结果继续。
       </p>
 
       <Card className="mt-8" enter={0}>
         <SectionTitle
           icon={Layers}
           title="模型"
-          hint="任务决定输出形态，家族决定架构，规模决定速度与精度的取舍。"
+          hint="先决定权重从哪来，再决定架构长什么样。"
         />
 
-        <ChoiceRow label="任务">
+        <ChoiceRow label="从哪开始">
+          <div className="grid grid-cols-3 gap-2">
+            {INIT_MODES.map((item) => {
+              const Icon = item.icon;
+              const active = initMode === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => setInitMode(item.id)}
+                  aria-pressed={active}
+                  data-init-mode={item.id}
+                  className={cx(
+                    "press flex items-start gap-2.5 rounded-[10px] border px-3 py-2.5 text-left",
+                    "transition-[background-color,border-color,color] duration-120 ease-out",
+                    active
+                      ? "border-ink bg-ink text-canvas"
+                      : "border-line-strong bg-canvas hover:border-ink/40 hover:bg-surface",
+                  )}
+                >
+                  <Icon size={15} strokeWidth={2.4} className="mt-0.5 shrink-0" />
+                  <span className="min-w-0">
+                    <span className="block text-[13px] leading-tight font-bold">
+                      {item.label}
+                    </span>
+                    <span
+                      className={cx(
+                        "mt-1 block text-[10.5px] leading-snug font-semibold",
+                        active ? "text-canvas/65" : "text-ink-faint",
+                      )}
+                    >
+                      {item.note}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </ChoiceRow>
+
+        {initMode === "scratch" ? (
+          <>
+            <ChoiceRow label="任务">
           <div className="grid grid-cols-3 gap-2">
             {TASKS.map((item) => {
               const Icon = item.icon;
@@ -309,15 +427,88 @@ export default function TrainPage({
             </span>
           </div>
         )}
+          </>
+        ) : initMode === "finetune" ? (
+          <ChoiceRow
+            label="已有模型"
+            hint=".bpk 文件，训练产物里的 exports/best.bpk"
+          >
+            <div className="flex items-center gap-3 rounded-[10px] bg-surface px-3.5 py-3">
+              <CopyPlus size={15} strokeWidth={2.4} className="shrink-0 text-ink-faint" />
+              <code className="min-w-0 flex-1 truncate font-mono text-[12.5px] font-bold">
+                {modelPath ?? "还没有选择模型"}
+              </code>
+              <Button
+                variant="secondary"
+                icon={FolderOpen}
+                size="sm"
+                className="shrink-0"
+                onClick={() => {
+                  void pickModelFile().then((picked) => {
+                    if (picked) setModelPath(picked);
+                  });
+                }}
+              >
+                选择
+              </Button>
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed font-medium text-ink-faint">
+              它的架构和类别表会沿用，但训练从头计轮——优化器状态不继承。
+              想接着上次的进度，请改用「继续上次训练」。
+            </p>
+          </ChoiceRow>
+        ) : (
+          <ChoiceRow
+            label="训练检查点"
+            hint="runs/<名称>/checkpoints/last 目录"
+          >
+            <div className="flex items-center gap-3 rounded-[10px] bg-surface px-3.5 py-3">
+              <History size={15} strokeWidth={2.4} className="shrink-0 text-ink-faint" />
+              <code className="min-w-0 flex-1 truncate font-mono text-[12.5px] font-bold">
+                {checkpointPath ?? "还没有选择检查点"}
+              </code>
+              <Button
+                variant="secondary"
+                icon={FolderOpen}
+                size="sm"
+                className="shrink-0"
+                onClick={() => {
+                  void pickFolder("选择 checkpoints/last 目录").then((picked) => {
+                    if (picked) setCheckpointPath(picked);
+                  });
+                }}
+              >
+                选择
+              </Button>
+            </div>
+            <p className="mt-2 text-[11px] leading-relaxed font-medium text-ink-faint">
+              数据集、批大小和总轮数都从检查点里读，下面的参数不会生效。
+              目录里必须有 manifest.json、model.bin 和 optimizer.bin。
+            </p>
+          </ChoiceRow>
+        )}
       </Card>
 
       <Card className="mt-4" enter={1}>
         <SectionTitle
           icon={Gauge}
           title="训练参数"
-          hint="不确定就保持默认。拖动字段右侧的箭头可以左右调节。"
+          hint={
+            initMode === "resume"
+              ? "续训时轮数、批大小和分辨率都由检查点决定，这里的值不会生效。"
+              : "不确定就保持默认。拖动字段右侧的箭头可以左右调节。"
+          }
         />
-        <div className="grid grid-cols-3 gap-4">
+        {/* Dimmed rather than hidden: the checkpoint's values are still worth seeing, and a card
+            that silently loses its inputs looks broken. Not a `disabled` prop on each field —
+            NumberField's drag handles are not native controls, so pointer-events is what actually
+            stops them. */}
+        <div
+          className={cx(
+            "grid grid-cols-3 gap-4 transition-opacity duration-150",
+            initMode === "resume" && "pointer-events-none opacity-40",
+          )}
+        >
           <NumberField
             label="训练轮数"
             hint="轮数越多越充分，也越费时间"
@@ -424,17 +615,23 @@ export default function TrainPage({
         style={{ animationDelay: "110ms" }}
       >
         <div
-          key={dataset ? "ready" : "empty"}
+          key={missing ?? initMode}
           className="flex min-w-0 animate-fade-in items-center gap-2.5"
         >
-          {dataset ? (
+          {missing === null ? (
             <>
-              <Wand2 size={15} strokeWidth={2.4} className="shrink-0 text-ink-soft" />
+              {initMode === "resume" ? (
+                <History size={15} strokeWidth={2.4} className="shrink-0 text-ink-soft" />
+              ) : (
+                <Wand2 size={15} strokeWidth={2.4} className="shrink-0 text-ink-soft" />
+              )}
               <span className="text-[12px] font-semibold text-ink-faint">
-                将创建
+                {initMode === "resume" ? "将续训" : "将创建"}
               </span>
               <span className="tnum truncate text-[13px] font-bold text-ink">
-                {model} · {epochs} 轮 · batch {batch} · {imgsz}px · {device}
+                {initMode === "resume"
+                  ? tailPath(checkpointPath ?? "")
+                  : `${model} · ${epochs} 轮 · batch ${batch} · ${imgsz}px · ${device}`}
               </span>
             </>
           ) : (
@@ -445,16 +642,18 @@ export default function TrainPage({
                 className="shrink-0 text-warn"
               />
               <span className="text-[13px] font-semibold text-ink">
-                还差一步：选一个数据集
+                还差一步：{missing}
               </span>
               <span className="hidden text-[12px] font-medium text-ink-faint sm:inline">
-                训练需要 images + labels
+                {initMode === "resume"
+                  ? "指向 checkpoints/last 目录"
+                  : "训练需要 images + labels"}
               </span>
             </>
           )}
         </div>
 
-        {dataset ? (
+        {missing === null ? (
           <Button
             icon={Play}
             size="lg"
@@ -462,22 +661,46 @@ export default function TrainPage({
             loading={starting}
             disabled={!ready}
             title={
-              !paramsValid
-                ? "参数超出范围，先修正再开始"
-                : (problem ?? undefined)
+              initMode === "resume"
+                ? undefined
+                : !paramsValid
+                  ? "参数超出范围，先修正再开始"
+                  : (problem ?? undefined)
             }
             className="shrink-0"
           >
-            {running ? "训练中" : "开始训练"}
+            {running
+              ? "训练中"
+              : initMode === "resume"
+                ? "继续训练"
+                : "开始训练"}
           </Button>
         ) : (
           <Button
             icon={FolderOpen}
             size="lg"
-            onClick={onGoDataset}
+            onClick={
+              initMode === "resume"
+                ? () => {
+                    void pickFolder("选择 checkpoints/last 目录").then((picked) => {
+                      if (picked) setCheckpointPath(picked);
+                    });
+                  }
+                : initMode === "finetune" && dataset
+                  ? () => {
+                      void pickModelFile().then((picked) => {
+                        if (picked) setModelPath(picked);
+                      });
+                    }
+                  : onGoDataset
+            }
             className="shrink-0"
           >
-            去选择数据集
+            {initMode === "resume"
+              ? "选择检查点"
+              : initMode === "finetune" && dataset
+                ? "选择模型"
+                : "去选择数据集"}
           </Button>
         )}
       </div>

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::engine::TrainRequest;
+use crate::engine::{TrainInit, TrainRequest};
 use crate::runtime::Runtime;
 use crate::settings;
 
@@ -605,46 +605,74 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
     }
 
     // Accepted body shapes, in order of convenience for an assistant writing JSON by hand:
-    //   1. {"dataset": "...", "epochs": 10}                    — everything else defaulted
-    //   2. {"architecture": "...", "dataset": "...", ...}      — the full TrainRequest
+    //   1. {"dataset": "...", "epochs": 10}                        — scratch, everything defaulted
+    //   2. {"architecture": "...", "dataset": "...", ...}          — explicit scratch
+    //   3. {"init": {"mode": "finetune", "model": "..."}, ...}     — from a finished .bpk
+    //   4. {"init": {"mode": "resume", "checkpoint": "..."}}       — continue a run exactly
+    // Shapes 1 and 2 are the original contract and stay supported: a saved prompt or a手写 script
+    // should not break because a newer field exists.
     let partial: Value = match serde_json::from_slice(&request.body) {
         Ok(value) => value,
         Err(error) => return Response::error(400, format!("JSON 解析失败：{error}")),
     };
+    let init = match partial.get("init") {
+        Some(raw) => match serde_json::from_value::<TrainInit>(raw.clone()) {
+            Ok(value) => value,
+            Err(error) => {
+                return Response::error(
+                    400,
+                    format!(
+                        "init 无法解析：{error}。\
+                         应为 {{\"mode\":\"scratch\",\"architecture\":\"yolo26n\"}}、\
+                         {{\"mode\":\"finetune\",\"model\":\"…/best.bpk\"}} 或 \
+                         {{\"mode\":\"resume\",\"checkpoint\":\"…/checkpoints/last\"}}。"
+                    ),
+                );
+            }
+        },
+        None => {
+            // The window validates architecture in TrainPage; an HTTP caller bypasses that
+            // entirely, so the same bound is repeated here.
+            let architecture = partial
+                .get("architecture")
+                .and_then(Value::as_str)
+                .unwrap_or("yolo26n")
+                .to_owned();
+            if !valid_architecture(&architecture) {
+                return Response::error(
+                    400,
+                    "architecture 只能包含字母、数字、点、下划线和连字符，且不能以 - 开头。",
+                );
+            }
+            TrainInit::Scratch { architecture }
+        }
+    };
+
+    // Resume takes its dataset from the checkpoint. Demanding one here would reject the only
+    // correct way to call it.
+    let needs_dataset = !matches!(init, TrainInit::Resume { .. });
     let dataset = partial
         .get("dataset")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim()
         .to_owned();
-    if dataset.is_empty() {
-        return Response::error(
-            400,
-            "缺少 dataset。它是一个包含 dataset.yaml 的目录，或 yaml 文件本身的绝对路径。",
-        );
-    }
-    if !Path::new(&dataset).exists() {
-        return Response::error(400, format!("dataset 路径不存在：{dataset}"));
-    }
-    let dataset_path = Path::new(&dataset);
-    if dataset_path.is_dir() && !dataset_path.join("dataset.yaml").is_file() {
-        return Response::error(400, format!("目录里没有 dataset.yaml：{dataset}"));
+    if needs_dataset {
+        if dataset.is_empty() {
+            return Response::error(
+                400,
+                "缺少 dataset。它是一个包含 dataset.yaml 的目录，或 yaml 文件本身的绝对路径。",
+            );
+        }
+        if !Path::new(&dataset).exists() {
+            return Response::error(400, format!("dataset 路径不存在：{dataset}"));
+        }
+        let dataset_path = Path::new(&dataset);
+        if dataset_path.is_dir() && !dataset_path.join("dataset.yaml").is_file() {
+            return Response::error(400, format!("目录里没有 dataset.yaml：{dataset}"));
+        }
     }
 
-    // The window validates these in TrainPage; an HTTP caller bypasses that entirely. Keep the
-    // two entry points honest with the same bounds instead of letting a 0-sized batch reach the
-    // engine and fail twenty seconds later with an opaque error.
-    let architecture = partial
-        .get("architecture")
-        .and_then(Value::as_str)
-        .unwrap_or("yolo26n")
-        .to_owned();
-    if !valid_architecture(&architecture) {
-        return Response::error(
-            400,
-            "architecture 只能包含字母、数字、点、下划线和连字符，且不能以 - 开头。",
-        );
-    }
     let epochs = uint(&partial, "epochs").unwrap_or(1);
     let batch = uint(&partial, "batch").unwrap_or(8);
     let imgsz = uint(&partial, "imgsz");
@@ -662,7 +690,7 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
 
     let defaults = runtime.settings();
     let train = TrainRequest {
-        architecture,
+        init,
         dataset,
         epochs,
         batch,
@@ -677,7 +705,8 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
     let accepted = json!({
         "ok": true,
         "accepted": {
-            "architecture": train.architecture,
+            "init": serde_json::to_value(&train.init).unwrap_or(Value::Null),
+            "dataset": if train.dataset.is_empty() { Value::Null } else { json!(train.dataset) },
             "epochs": train.epochs,
             "batch": train.batch,
             "imgsz": train.imgsz,

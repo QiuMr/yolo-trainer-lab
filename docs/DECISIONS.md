@@ -570,3 +570,78 @@ ultralytics 源码**（不是 pip wheel），YOLOX 还需官方 `0.1.1rc0` check
 
 出现"模型要部署到没有训练器的环境"的真实需求时再做。优先选 1（符合免环境理念），
 需求急且能接受联网时先用 2 过渡。
+
+---
+
+## D026 · ONNX 导出：骨架方案成立，但检测模型被上游结构错配卡住
+
+**背景**：用户确认"用这个软件的人就是要拿模型去别处推理，一般就是 ONNX"，所以要做
+**不装 Python 的 ONNX 导出**。本轮做了环境、验证和一处上游修复，结论如下。
+
+### 已完成：方案可行性验证通过（分类模型）
+
+用"权重清零 → 结构指纹比对 → 回填 → 数值比对"验证"图结构正交于权重"这条假设，
+脚本 `spikes/qa/probe_onnx_skeleton.py`：
+
+| 检查 | 结果 |
+| --- | --- |
+| 权重清零后图结构不变（op 序列 / 张量名 / shape / dtype 指纹） | ✅ 202 节点、80 个 initializer 前后完全一致 |
+| 清零后的骨架通过 `onnx.checker` | ✅ |
+| 回填原始权重后输出与原始模型一致 | ✅ **max\|diff\| = 0.000e+00**（逐字节） |
+| initializer 名字唯一（name→offset 表可寻址） | ✅ 80 个无重复 |
+
+→ **骨架 + 填权重方案成立**，可以在客户端用纯 Rust 完成，不需要 Python。
+
+### 已完成：修掉一个致命上游 bug（类别数不读模型）
+
+`ExportSpec::for_model` 的 `num_classes` 是**写死**的：分类 1000、语义 19、深度 1、其余 80。
+Python 侧却用它建图（`classes = int(manifest["num_classes"])`），所以任何在自定义数据集上训的
+模型都会在 state-dict 审计里失败（分类表现为 `2 wrong-shape keys`）。
+
+已在 `src/export/mod.rs::export_onnx_inner` 里补：从 `artifact_metadata(weights).class_names`
+读真实类别数覆盖 spec（仅对 detect/segment/classify）。实测输出
+`Overriding model.yaml nc=1000 with nc=3`，3 类分类模型导出成功（6.17 MB，ORT 校验通过）。
+
+### 阻塞 1：检测头的隐藏通道下限不一致（可修，但代价大）
+
+yolov8n（3 类）导出失败：**0 missing / 0 unexpected / 33 wrong-shape**，全部集中在
+`model.22.cv3.*`（分类分支的所有张量，3 尺度 × 11）。
+
+根因是两边算隐藏通道的公式不同：
+
+| | 公式 | p3=64 时 |
+| --- | --- | --- |
+| montgomery `head.rs` | `p3_channels.max(DEFAULT_NUM_CLASSES.min(100))` | max(64, 80) = **80** |
+| ultralytics | `max(16, ch // 4, reg_max * 4)` | max(16, 16, 64) = **64** |
+
+所以整个 cv3 分支通道数不同（80 vs 64），与 nc 无关。**只有 COCO 80 类这种"恰好相等"的情况
+能导出**——上游显然只在 COCO 上验证过这条路径。
+
+修法：把各 `head.rs` 的 `cls_channels` 改成与 ultralytics 一致。
+**代价：改变模型结构，所有已训 checkpoint 全部不兼容，需要重训。** 需用户拍板。
+
+### 阻塞 2：yolo26 系列结构不同（更难）
+
+yolo26n（3 类）导出失败：**102 unexpected + 48 wrong-shape**。
+
+- unexpected 全部是 `head.o2m_p3/p4/p5`（one-to-many 头，每层 34 个）
+- wrong-shape 全部是 `model.23.one2one_cv3`（one-to-one 头）
+
+即 montgomery 的 yolo26 是 **o2m + one2one 双头**实现，而 ultralytics 461196c 的 `yolo26n.yaml`
+只有 one2one。这不是 keymap 能补的，是架构级差异。yolo26 是我们的默认推荐架构，所以这一条
+直接决定 ONNX 功能的覆盖面。
+
+### 环境侧的坑（只影响我们复现，不影响产品）
+
+上游 `tools/onnx/requirements.lock.txt` **不完整**：缺 `opencv-python`、`torchvision`、
+`filelock`、`polars`、`nvidia-ml-py`、`ultralytics-thop`（`ultralytics/__init__.py` 一 import 就炸）。
+另外直接装 `torchvision` 会把 `torch` 从 2.13.0 顶到 2.15.0，破坏 lock 的一致性 —— 必须
+`uv pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.13.0" torchvision`
+让它按 torch 的 pin 解算（得到 torchvision 0.28.0）。
+
+开发期环境落在 `research/montgomery/target/.venv`（`research/` 已 gitignore，不会入库）。
+
+### 下一步（需决策）
+
+1. 是否改 head 对齐 ultralytics（检测可导出，已训模型作废重训）
+2. yolo26 双头怎么办：单独适配 keymap + Python 侧建双头图，或把 yolo26 排除在 ONNX 支持之外

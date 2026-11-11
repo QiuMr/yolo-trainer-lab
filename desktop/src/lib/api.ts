@@ -33,8 +33,22 @@ export type DatasetSummary = {
   warning: string | null;
 };
 
+/**
+ * How a run starts. `montgomery train` accepts exactly one of these, so the shell models it as a
+ * choice rather than three optional fields that can contradict each other.
+ *
+ * `finetune` and `resume` are not interchangeable, and the difference is invisible in the UI unless
+ * it is stated: a `.bpk` starts a **new** run (optimizer, EMA and epoch counter all restart), while
+ * a checkpoint continues them. Picking the wrong one looks like it worked.
+ */
+export type TrainInit =
+  | { mode: "scratch"; architecture: string }
+  | { mode: "finetune"; model: string }
+  | { mode: "resume"; checkpoint: string };
+
 export type TrainRequest = {
-  architecture: string;
+  init: TrainInit;
+  /** Manifest for scratch/finetune; empty for resume, which takes the dataset from the checkpoint. */
   dataset: string;
   epochs: number;
   batch: number;
@@ -276,13 +290,24 @@ export async function pickFolder(title: string): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
-export async function pickEngineFile(): Promise<string | null> {
-  if (!isTauri) return null;
+export async function pickEngineFile(): Promise<string | null> {  if (!isTauri) return null;
   const { open } = await import("@tauri-apps/plugin-dialog");
   const selected = await open({
     multiple: false,
     title: "选择 montgomery 引擎",
     filters: [{ name: "可执行文件", extensions: ["exe"] }],
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+/** A finished model, used as the starting point for a new run (finetune). */
+export async function pickModelFile(): Promise<string | null> {
+  if (!isTauri) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    multiple: false,
+    title: "选择一个 .bpk 模型",
+    filters: [{ name: "Montgomery 模型", extensions: ["bpk"] }],
   });
   return typeof selected === "string" ? selected : null;
 }
