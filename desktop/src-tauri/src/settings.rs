@@ -69,10 +69,15 @@ impl Settings {
     }
 
     pub fn output_dir_or(&self, fallback: &Path) -> PathBuf {
-        match self.output_dir.as_deref() {
+        let chosen = match self.output_dir.as_deref() {
             Some(explicit) => PathBuf::from(explicit),
             None => fallback.to_path_buf(),
-        }
+        };
+        // A relative path resolves against the *install directory* in a packaged build, so the
+        // user would see "runs/" in settings while the files land somewhere unfindable.
+        // `absolute` (unlike canonicalize) works before the directory exists and adds no \\?\
+        // prefix on Windows — the same choice dataset.rs makes for manifests.
+        std::path::absolute(&chosen).unwrap_or(chosen)
     }
 }
 

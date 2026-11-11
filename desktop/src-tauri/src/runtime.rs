@@ -32,6 +32,11 @@ pub struct SettingsView {
     pub output_dir_is_default: bool,
     pub config_dir: String,
     pub engine_running: bool,
+    /// The port the user configured (`0` = let the OS pick). This is **not** `control.port`,
+    /// which is the port actually bound after a fallback. Saving `control.port` back as the
+    /// configured value used to pin a random port into `settings.json` and restart the service
+    /// on every unrelated settings change.
+    pub control_port: u16,
     /// State of the AI-facing HTTP service, including the port it actually got — which is not
     /// necessarily the one that was asked for (see `control::start`).
     pub control: ControlInfo,
@@ -124,6 +129,7 @@ impl Runtime {
             output_dir_is_default: current.output_dir.is_none(),
             config_dir: self.0.config_dir.to_string_lossy().into_owned(),
             engine_running: self.0.engine.is_running(),
+            control_port: current.control_port,
             control: self.control(),
         }
     }

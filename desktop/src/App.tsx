@@ -75,11 +75,23 @@ export default function App() {
   }, [refresh]);
 
   // Subscribe once, at the shell: a page switch must not drop a running stream.
+  //
+  // The unsubscribe handle only arrives after a promise, which means the cleanup can run first —
+  // and it does, every time, under StrictMode's mount/unmount/mount. Pushing into a `disposers`
+  // array that the cleanup already walked past leaks the listener and, worse, leaves a second one
+  // behind on the next mount: every epoch event would then be folded twice, doubling the loss
+  // series and the log. So the handle has to be registered against the liveness flag, not a list.
   useEffect(() => {
+    let alive = true;
     const disposers: Array<() => void> = [];
-    void onEngineEvent(applyEvent).then((off) => disposers.push(off));
-    void onEngineLog((line) => pushLog(line)).then((off) => disposers.push(off));
+    const keep = (off: () => void) => {
+      if (alive) disposers.push(off);
+      else off();
+    };
+    void onEngineEvent(applyEvent).then(keep);
+    void onEngineLog((line) => pushLog(line)).then(keep);
     return () => {
+      alive = false;
       for (const dispose of disposers) dispose();
     };
   }, []);
@@ -94,12 +106,19 @@ export default function App() {
   // Drop a folder anywhere on the window to scan it. Registered here rather than on the
   // dataset page because the gesture is unambiguous from any screen, and having to
   // navigate first would make people drop it, see nothing, and try the dialog instead.
+  //
+  // Scanning is slow on a large tree, so a second drop can easily land before the first
+  // resolves. Sequencing keeps the answer on screen matching the folder that was last dropped —
+  // without it a slow scan of A finishes after a fast scan of B and silently overwrites it.
+  const scanSeq = useRef(0);
   const onDrop = useCallback(
     async (paths: string[]) => {
       const target = paths[0];
       if (!target) return;
+      const seq = ++scanSeq.current;
       try {
         const summary = await scanDataset(target);
+        if (seq !== scanSeq.current) return;
         setState({ dataset: summary });
         go("dataset");
         toast(
@@ -107,6 +126,7 @@ export default function App() {
           "ok",
         );
       } catch (cause) {
+        if (seq !== scanSeq.current) return;
         toast(typeof cause === "string" ? cause : String(cause), "danger", 5000);
       }
     },

@@ -34,18 +34,31 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A running service. Cheap to clone; `stop` is the only way to end it, and it is asynchronous
-/// (the accept loop notices within one poll interval).
+/// A running service. Cheap to clone; `stop` is the only way to end it, and it is synchronous
+/// (it waits for the accept loop to release the listening socket).
 #[derive(Clone)]
 pub struct Handle {
     pub port: u16,
     pub token: String,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl Handle {
     pub fn stop(&self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The accept loop owns the TcpListener. Joining is the only way to know the socket is
+        // actually closed: without it, stop→start re-binds while the old listener still holds
+        // the port and silently falls back to an OS-assigned random port, invalidating every
+        // prompt the user already pasted into an assistant.
+        let worker = self
+            .worker
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(worker) = worker {
+            let _ = worker.join();
+        }
     }
 }
 
@@ -73,17 +86,17 @@ pub fn start(runtime: Runtime, requested_port: u16) -> Result<Handle, String> {
         .set_nonblocking(true)
         .map_err(|error| format!("无法配置监听器：{error}"))?;
 
-    let worker = runtime.clone();
+    let worker_runtime = runtime.clone();
     let worker_token = token.clone();
     let worker_stop = stop.clone();
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         while !worker_stop.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _)) => {
                     // Accepted sockets inherit the listener's non-blocking flag on Windows; the
                     // per-request reader assumes blocking IO.
                     let _ = stream.set_nonblocking(false);
-                    let runtime = worker.clone();
+                    let runtime = worker_runtime.clone();
                     let token = worker_token.clone();
                     std::thread::spawn(move || handle(stream, &runtime, &token, started));
                 }
@@ -95,9 +108,15 @@ pub fn start(runtime: Runtime, requested_port: u16) -> Result<Handle, String> {
                 Err(_) => std::thread::sleep(Duration::from_millis(500)),
             }
         }
+        // `listener` is dropped here, before `stop()`'s join() returns.
     });
 
-    Ok(Handle { port, token, stop })
+    Ok(Handle {
+        port,
+        token,
+        stop,
+        worker: std::sync::Arc::new(std::sync::Mutex::new(Some(worker))),
+    })
 }
 
 /// The token is generated once and then reused. Writing it next to `settings.json` also gives the
@@ -196,6 +215,8 @@ impl Response {
             404 => "Not Found",
             405 => "Method Not Allowed",
             409 => "Conflict",
+            413 => "Payload Too Large",
+            431 => "Request Header Fields Too Large",
             500 => "Internal Server Error",
             _ => "Unknown",
         }
@@ -203,8 +224,12 @@ impl Response {
 }
 
 fn handle(mut stream: TcpStream, runtime: &Runtime, token: &str, started: Instant) {
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
+    // Ignoring a failure here would make IO_TIMEOUT a no-op, so treat it as a broken connection.
+    if stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(IO_TIMEOUT)).is_err()
+    {
+        return;
+    }
 
     let Ok(peer) = stream.peer_addr() else { return };
     // Belt and braces: the listener is already loopback-only, but a future change to bind
@@ -216,44 +241,53 @@ fn handle(mut stream: TcpStream, runtime: &Runtime, token: &str, started: Instan
 
     let Ok(reader_stream) = stream.try_clone() else { return };
     let mut reader = BufReader::new(reader_stream);
-    let Some(request) = read_request(&mut reader, &mut stream) else {
-        return;
+    let request = match read_request(&mut reader, &mut stream, token) {
+        Ok(Some(request)) => request,
+        // The peer hung up before sending anything worth answering.
+        Ok(None) => return,
+        Err(response) => {
+            let _ = write_response(&mut stream, &response);
+            return;
+        }
     };
-
-    // `GET /` is the self-describing document and is readable without a token: an assistant needs
-    // to be able to discover the shape of the API before it has been given the secret, and the
-    // document contains no data — only the contract.
-    let public = request.method == "GET" && (request.path == "/" || request.path == "/index.md");
-    if !public && !authorised(&request, token) {
-        let _ = write_response(
-            &mut stream,
-            &Response::json(
-                401,
-                json!({
-                    "ok": false,
-                    "error": "缺少或错误的令牌。请求头 Authorization: Bearer <token>，或查询参数 ?token=<token>。",
-                    "hint": "令牌在应用的设置页「AI 操控」区块，也在配置目录的 control-token 文件里。"
-                }),
-            ),
-        );
-        return;
-    }
 
     let response = route(&request, runtime, started);
     let _ = write_response(&mut stream, &response);
 }
 
-fn read_request(reader: &mut BufReader<TcpStream>, stream: &mut TcpStream) -> Option<Request> {
-    let mut line = String::new();
-    if reader.read_line(&mut line).ok()? == 0 {
-        return None;
+/// Parse one request and authorise it **before** reading the body. `Err(Response)` means the
+/// caller gets a real HTTP status instead of an empty reply: a bare `return None` here used to
+/// turn every malformed request into "Empty reply from server".
+fn read_request(
+    reader: &mut BufReader<TcpStream>,
+    stream: &mut TcpStream,
+    token: &str,
+) -> Result<Option<Request>, Response> {
+    let mut budget = 0usize;
+    let line = read_limited_line(reader, &mut budget)?;
+    if line.is_empty() {
+        return Ok(None);
     }
-    let mut parts = line.trim_end().split_whitespace();
-    let method = parts.next()?.to_uppercase();
-    let target = parts.next()?.to_owned();
-    // Some HTTP/1.0 clients omit the version; anything present is ignored, because the only
-    // version that matters here is "close after one response".
-    let _ = parts.next();
+    let mut parts = line.trim_end().split(' ');
+    let method = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Response::error(400, "请求行缺少方法。"))?
+        .to_uppercase();
+    let target = parts
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| Response::error(400, "请求行缺少路径。"))?
+        .to_owned();
+    // HTTP/1.0 clients may omit the version; a fourth token (or a non-HTTP third one) means the
+    // URL contained a raw space. Silently truncating it produced a confusing 404.
+    let version = parts.next().unwrap_or("");
+    if (!version.is_empty() && !version.starts_with("HTTP/")) || parts.next().is_some() {
+        return Err(Response::error(
+            400,
+            "URL 里的空格必须编码成 %20；路径请 percent-encode。",
+        ));
+    }
 
     let (raw_path, raw_query) = match target.split_once('?') {
         Some((path, query)) => (path, query),
@@ -263,27 +297,56 @@ fn read_request(reader: &mut BufReader<TcpStream>, stream: &mut TcpStream) -> Op
     let query = parse_query(raw_query);
 
     let mut headers = HashMap::new();
-    let mut consumed = 0usize;
     loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header).ok()? == 0 {
-            return None;
-        }
-        consumed += header.len();
-        if consumed > MAX_HEADER_BYTES {
-            return None;
-        }
-        let trimmed = header.trim_end_matches(['\r', '\n']);
+        let line = read_limited_line(reader, &mut budget)?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             break;
         }
         if let Some((name, value)) = trimmed.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
+            let key = name.trim().to_ascii_lowercase();
+            if headers.insert(key, value.trim().to_owned()).is_some() {
+                return Err(Response::error(400, "请求头重复。"));
+            }
         }
     }
 
-    // curl sends this for bodies over ~1 KB and then waits up to a second for permission. Saying
-    // "go ahead" is one line and removes a second from every training request.
+    // `GET /` is the self-describing document and is readable without a token: an assistant
+    // needs to discover the contract before it has been given the secret, and it contains no
+    // data. Everything else is authenticated here, before any body bytes are buffered, so an
+    // unauthenticated caller cannot make us allocate 1 MB or receive `100 Continue`.
+    let public = method == "GET" && (path == "/" || path == "/index.md");
+    if !public && !authorised(&headers, &query, token) {
+        return Err(Response::json(
+            401,
+            json!({
+                "ok": false,
+                "error": "缺少或错误的令牌。请求头 Authorization: Bearer <token>，或查询参数 ?token=<token>。",
+                "hint": "令牌在应用的设置页「AI 操控」区块，也在配置目录的 control-token 文件里。"
+            }),
+        ));
+    }
+
+    if headers
+        .get("transfer-encoding")
+        .is_some_and(|value| !value.is_empty())
+    {
+        return Err(Response::error(
+            400,
+            "不支持 Transfer-Encoding，请用 Content-Length。",
+        ));
+    }
+    let length = match headers.get("content-length") {
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| Response::error(400, "Content-Length 不是合法数字。"))?,
+        None => 0,
+    };
+    if length > MAX_BODY_BYTES {
+        return Err(Response::error(413, "请求体超过 1 MB 上限。"));
+    }
+
+    // curl sends this for bodies over ~1 KB and then waits up to a second for permission.
     if headers
         .get("expect")
         .map(|value| value.to_ascii_lowercase().contains("100-continue"))
@@ -293,23 +356,53 @@ fn read_request(reader: &mut BufReader<TcpStream>, stream: &mut TcpStream) -> Op
         let _ = stream.flush();
     }
 
-    let length = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(MAX_BODY_BYTES);
     let mut body = vec![0u8; length];
-    if length > 0 && reader.read_exact(&mut body).is_err() {
-        return None;
+    if length > 0 {
+        reader
+            .read_exact(&mut body)
+            .map_err(|_| Response::error(400, "请求体不完整或读取超时。"))?;
     }
 
-    Some(Request {
+    Ok(Some(Request {
         method,
         path,
         query,
         headers,
         body,
-    })
+    }))
+}
+
+/// Read through the next `\n` without allocating beyond the shared header budget.
+/// `BufRead::read_line` cannot do this: it grows until the newline arrives, so one 100 MB header
+/// line is enough to exhaust memory before any limit is checked.
+fn read_limited_line(
+    reader: &mut BufReader<TcpStream>,
+    budget: &mut usize,
+) -> Result<String, Response> {
+    let mut bytes = Vec::new();
+    loop {
+        let (take, complete) = {
+            let available = reader
+                .fill_buf()
+                .map_err(|_| Response::error(400, "读取请求失败或超时。"))?;
+            if available.is_empty() {
+                break;
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let take = newline.map(|index| index + 1).unwrap_or(available.len());
+            if *budget + take > MAX_HEADER_BYTES {
+                return Err(Response::error(431, "请求头超过 16 KB 上限。"));
+            }
+            bytes.extend_from_slice(&available[..take]);
+            (take, newline.is_some())
+        };
+        reader.consume(take);
+        *budget += take;
+        if complete {
+            return Ok(String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn write_response(stream: &mut TcpStream, response: &Response) -> std::io::Result<()> {
@@ -329,12 +422,21 @@ fn write_response(stream: &mut TcpStream, response: &Response) -> std::io::Resul
     stream.flush()
 }
 
-fn authorised(request: &Request, token: &str) -> bool {
-    let presented = request
-        .header("authorization")
-        .and_then(|value| value.strip_prefix("Bearer ").or_else(|| value.strip_prefix("bearer ")))
+fn authorised(
+    headers: &HashMap<String, String>,
+    query: &HashMap<String, String>,
+    token: &str,
+) -> bool {
+    // The auth-scheme is case-insensitive per RFC 7235; `strip_prefix("Bearer ")` rejected
+    // `BEARER` and `bEaReR` for no reason.
+    let presented = headers
+        .get("authorization")
+        .and_then(|value| {
+            let (scheme, rest) = value.split_once(' ')?;
+            scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+        })
         .map(str::to_owned)
-        .or_else(|| request.query.get("token").cloned());
+        .or_else(|| query.get("token").cloned());
     match presented {
         Some(value) => constant_time_eq(value.as_bytes(), token.as_bytes()),
         None => false,
@@ -366,15 +468,21 @@ fn parse_query(raw: &str) -> HashMap<String, String> {
 
 /// Percent-decoding into a `String` with UTF-8 awareness: dataset paths are Windows paths with
 /// Chinese folder names, and a byte-wise decode would mangle them into invalid UTF-8.
+///
+/// Work on the **byte slice only**. `&input[index+1..index+3]` used to slice the `&str` by byte
+/// offsets: when a `%` was followed by a multi-byte character, the end of that slice landed
+/// inside a code point and Rust panicked. With `panic = "abort"` that killed the whole app,
+/// from an unauthenticated GET — the query is parsed before the token is checked.
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = &input[index + 1..index + 3];
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                out.push(byte);
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                out.push((high << 4) | low);
                 index += 3;
                 continue;
             }
@@ -383,6 +491,15 @@ fn percent_decode(input: &str) -> String {
         index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /* ───────────────────────────── routes ───────────────────────────── */
@@ -398,7 +515,9 @@ fn route(request: &Request, runtime: &Runtime, started: Instant) -> Response {
             json!({
                 "ok": true,
                 "app": "yolo-trainer-lab",
-                "version": env!("CARGO_PKG_VERSION"),
+                // Not CARGO_PKG_VERSION: Cargo.toml is deliberately frozen at 0.1.0 while
+                // tauri.conf.json is the single source of truth (see build.rs / D022).
+                "version": crate::version::VERSION,
                 "uptime_s": started.elapsed().as_secs(),
                 "running": runtime.engine().is_running(),
                 "engine": runtime.view().engine_resolved,
@@ -462,11 +581,16 @@ fn route(request: &Request, runtime: &Runtime, started: Instant) -> Response {
                 Err(error) => Response::error(500, error),
             }
         }
-        (method, path) if path == "/train" || path == "/stop" || path == "/settings" => {
+        // A known path with the wrong method is 405, not 404. Listing them explicitly keeps the
+        // error honest for an AI client that is probing the API.
+        (method, path)
+            if [
+                "/", "/index.md", "/health", "/state", "/events", "/train", "/stop",
+                "/predict", "/datasets/scan", "/settings",
+            ]
+            .contains(&path) =>
+        {
             Response::error(405, format!("{method} 不被支持，该路径只接受特定的方法。"))
-        }
-        (method, path) if path == "/predict" => {
-            Response::error(405, format!("{method} 不被支持，请用 POST /predict。"))
         }
         _ => Response::error(
             404,
@@ -502,18 +626,47 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
     if !Path::new(&dataset).exists() {
         return Response::error(400, format!("dataset 路径不存在：{dataset}"));
     }
+    let dataset_path = Path::new(&dataset);
+    if dataset_path.is_dir() && !dataset_path.join("dataset.yaml").is_file() {
+        return Response::error(400, format!("目录里没有 dataset.yaml：{dataset}"));
+    }
+
+    // The window validates these in TrainPage; an HTTP caller bypasses that entirely. Keep the
+    // two entry points honest with the same bounds instead of letting a 0-sized batch reach the
+    // engine and fail twenty seconds later with an opaque error.
+    let architecture = partial
+        .get("architecture")
+        .and_then(Value::as_str)
+        .unwrap_or("yolo26n")
+        .to_owned();
+    if !valid_architecture(&architecture) {
+        return Response::error(
+            400,
+            "architecture 只能包含字母、数字、点、下划线和连字符，且不能以 - 开头。",
+        );
+    }
+    let epochs = uint(&partial, "epochs").unwrap_or(1);
+    let batch = uint(&partial, "batch").unwrap_or(8);
+    let imgsz = uint(&partial, "imgsz");
+    if !(1..=1000).contains(&epochs) {
+        return Response::error(400, "epochs 必须在 1 到 1000 之间。");
+    }
+    if !(1..=128).contains(&batch) {
+        return Response::error(400, "batch 必须在 1 到 128 之间。");
+    }
+    if let Some(size) = imgsz {
+        if !(64..=2048).contains(&size) || size % 32 != 0 {
+            return Response::error(400, "imgsz 必须在 64 到 2048 之间，且是 32 的倍数。");
+        }
+    }
 
     let defaults = runtime.settings();
     let train = TrainRequest {
-        architecture: partial
-            .get("architecture")
-            .and_then(Value::as_str)
-            .unwrap_or("yolo26n")
-            .to_owned(),
+        architecture,
         dataset,
-        epochs: uint(&partial, "epochs").unwrap_or(1),
-        batch: uint(&partial, "batch").unwrap_or(8),
-        imgsz: uint(&partial, "imgsz"),
+        epochs,
+        batch,
+        imgsz,
         device: partial
             .get("device")
             .and_then(Value::as_str)
@@ -535,6 +688,9 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
 
     match runtime.start_training(&train) {
         Ok(()) => Response::json(202, accepted),
+        // The early is_running() check is a TOCTOU window; Engine::start is now atomic, so a
+        // race shows up here as an error rather than a second orphan process. Report it as 409.
+        Err(error) if error.contains("已有训练") => Response::error(409, error),
         Err(error) => Response::error(500, error),
     }
 }
@@ -590,10 +746,24 @@ fn run_prediction(request: &Request, runtime: &Runtime) -> Response {
     }
 }
 
-fn uint(value: &Value, key: &str) -> Option<u32> {    value
+fn uint(value: &Value, key: &str) -> Option<u32> {
+    value
         .get(key)
         .and_then(Value::as_u64)
         .and_then(|number| u32::try_from(number).ok())
+}
+
+/// Model IDs are `yolo26n`, `yolov8x-seg`, `yolo26n-cls`, `yolox-tiny`, … . Rejecting a leading
+/// `-` matters: the value is passed as `--architecture <value>` and clap would otherwise read a
+/// value like `--foo` as a new flag.
+fn valid_architecture(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    value.len() <= 64
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
 /* ───────────────────────────── the document ───────────────────────────── */
@@ -615,13 +785,15 @@ fn guide(runtime: &Runtime) -> String {
   「设置 → AI 操控」复制。
 - 响应一律是 JSON（本文件除外），字段名用 snake_case。
 - 所有路径都是 **Windows 绝对路径**，反斜杠要写成 `\\`，或者用 `/`。
+- URL 里的空格和中文目录名必须 **percent-encode**（空格 `%20`，中文用 UTF-8 字节的 `%XX`）。
+  直接写空格会返回 400，而不是悄悄把路径截短。
 
 ## 端点
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
-| GET | `/` | 本文件 |
-| GET | `/health` | 服务与引擎是否活着 |
+| GET | `/` 或 `/index.md` | 本文件 |
+| GET | `/health` | 服务与引擎是否活着（含应用版本） |
 | GET | `/state` | 当前（或最近一次）训练的快照 |
 | GET | `/state?since=N` | 快照 + 序号大于 N 的新事件 |
 | GET | `/events?since=N` | 只要新事件，不重复快照 |
@@ -631,6 +803,10 @@ fn guide(runtime: &Runtime) -> String {
 | GET | `/datasets/scan?path=...` | 检查一个数据集目录是否可用 |
 | GET | `/settings` | 读配置 |
 | PUT | `/settings` | 改配置（整体替换，缺字段用默认值） |
+
+**`/state` 有两种响应形态**：不带参数时**直接**就是快照对象（`status`/`epoch`/`best` 在顶层）；
+带 `?since=N` 时是 `{{"ok":true,"state":{{...}},"cursor":N,"events":[...]}}`，同样的字段在
+`state` 子对象里。别把两种写法混用。
 
 ## 典型流程
 
@@ -684,13 +860,13 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
   "{base}/predict"
 ```
 
-`model` 可以省略，默认用最近一次训练导出的 `best`。返回 `result.prediction` 就是引擎的原始
-JSON：检测模型给 `detections`（`xmin/ymin/xmax/ymax/confidence/class_name`），分割模型另给
-`masks`，分类模型给 `classes`（top-5）。`result.output` 是标注后的图片路径，分类模型没有这个
-字段——它不画图。
+`model` 可省略，默认用最近一次训练导出的 `best`；`device` 可省略（默认 `cpu`），
+可传 `cpu`/`gpu`/`auto`。返回 `result.prediction` 就是引擎的原始 JSON：检测模型给
+`detections`（`xmin/ymin/xmax/ymax/confidence/class_name`），分割模型另给 `masks`，分类模型给
+`classes`（top-5）。`result.output` 是标注后的图片路径，分类模型返回 `null`——它不画图。
 
-推理固定跑在 CPU 上（`device` 可传 `cpu`/`gpu`）。标注图会写进应用自己的目录，
-**不会**写到你图片旁边。
+标注图**只能**落在应用自己的 `predictions/` 目录：请求里的 `output` 会被忽略，调用方无法把
+文件写回图片旁边，也无法指向任意路径。这样推理不会污染下一次的数据集扫描。
 
 ## 事件流（`/events`）
 
@@ -718,13 +894,19 @@ JSON：检测模型给 `detections`（`xmin/ymin/xmax/ymax/confidence/class_name
 
 ## 改配置
 
+**这是整体替换**：漏掉的字段会被静默还原成默认值。先 `GET /settings` 拿到 `settings` 对象，
+改其中一个字段再整份 PUT 回来。
+
 ```bash
 curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{{"default_device":"cpu"}}' "{base}/settings"
+  -d '{{"engine_path":null,"default_device":"cpu","output_dir":null,
+      "control_enabled":true,"control_port":47821}}' "{base}/settings"
 ```
 
 可写字段：`engine_path`（null = 自动检测）、`default_device`、`output_dir`（null = 默认）、
-`control_enabled`、`control_port`（改端口需要重启应用）。
+`control_enabled`、`control_port`（0 = 让系统选空闲端口）。改控制服务的开关或端口会**立即**
+重启监听，不需要重启应用；重启后 `GET /settings` 的 `control.port` 才是实际端口
+（端口被占用时可能不是你填的那个）。
 
 ## 注意事项
 
@@ -744,4 +926,79 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/j
             .clone()
             .unwrap_or_else(|| "未找到（用户需要在设置里指定）".to_string()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `%` followed by a multi-byte character used to slice `&str` in the middle of a code
+    /// point and panic. With `panic = "abort"` that killed the whole app — and the query is
+    /// parsed before the bearer token is checked, so it needed no credentials.
+    #[test]
+    fn percent_decode_never_panics_on_partial_utf8() {
+        assert_eq!(percent_decode("%E4%B8%AD"), "中");
+        assert_eq!(percent_decode("E:/中文%20图"), "E:/中文 图");
+        for nasty in [
+            "E:/%中文",
+            "E:/数据%图",
+            "path=E:/%中",
+            "%",
+            "%Z",
+            "%2",
+            "%%%",
+        ] {
+            let _ = percent_decode(nasty);
+        }
+        assert_eq!(percent_decode("%2f%2F"), "//");
+    }
+
+    #[test]
+    fn query_parsing_decodes_utf8_and_plus() {
+        let query = parse_query("path=E%3A%2F%E6%95%B0%E6%8D%AE%2Ftiny&since=12&q=a+b");
+        assert_eq!(query.get("path").unwrap(), "E:/数据/tiny");
+        assert_eq!(query.get("since").unwrap(), "12");
+        assert_eq!(query.get("q").unwrap(), "a b");
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let mut headers = HashMap::new();
+        for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+            headers.insert("authorization".to_owned(), format!("{scheme} tok"));
+            assert!(authorised(&headers, &HashMap::new(), "tok"), "{scheme}");
+        }
+        headers.insert("authorization".to_owned(), "Bearer nope".to_owned());
+        assert!(!authorised(&headers, &HashMap::new(), "tok"));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_equal() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+    }
+
+    #[test]
+    fn architecture_ids_are_constrained() {
+        for good in [
+            "yolo26n",
+            "yolov8x-seg",
+            "yolo26n-cls",
+            "yolox-tiny",
+            "yolov10b",
+        ] {
+            assert!(valid_architecture(good), "{good}");
+        }
+        for bad in ["--foo", "-seg", "", "yolo 26n", "a/b", "a\\b", "a&b"] {
+            assert!(!valid_architecture(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn health_reports_the_injected_version_not_cargo_pkg_version() {
+        // Guards D022: Cargo.toml is frozen at 0.1.0 while tauri.conf.json is the source of truth.
+        let _ = crate::version::VERSION;
+        assert_eq!(crate::version::VERSION.split('.').count(), 3);
+    }
 }

@@ -62,8 +62,13 @@ export default function UpdateCard() {
   /** `force` bypasses the cache — that is what the refresh button is for. */
   async function runCheck(force = false) {
     setChecking(true);
+    // `version` is the value captured at render time, which is `null` on the very first check.
+    // Tracking the version we just read locally means a failed check still labels itself with the
+    // real current version instead of "—".
+    let known = version;
     try {
       const current = await getAppVersion();
+      known = current;
       setVersion(current);
       if (!force) {
         const cached = readCache(current);
@@ -77,8 +82,8 @@ export default function UpdateCard() {
       if (!next.error) writeCache(next);
     } catch (cause) {
       setInfo({
-        current: version ?? "—",
-        latest: version ?? "—",
+        current: known ?? "—",
+        latest: known ?? "—",
         has_update: false,
         notes: "",
         error: String(cause),

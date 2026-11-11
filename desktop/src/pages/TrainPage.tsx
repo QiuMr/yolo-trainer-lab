@@ -99,17 +99,21 @@ export default function TrainPage({
 
   // Validation lives here, not in each field: the start button is the only thing that
   // actually needs a yes/no, and a field cannot know whether a half-typed value matters.
+  //
+  // `Number.isInteger` is not redundant. The shell takes `u32` for epochs/batch/imgsz, so a "1.5"
+  // passes every range check here and then fails in serde with a type error the user cannot read
+  // ("invalid type: floating point 1.5, expected u32"). Range alone is not the contract.
   const epochsN = Number(epochs);
   const batchN = Number(batch);
   const imgszN = imgsz.trim() === "" ? 640 : Number(imgsz);
   const paramsValid =
-    Number.isFinite(epochsN) &&
+    Number.isInteger(epochsN) &&
     epochsN >= 1 &&
     epochsN <= 1000 &&
-    Number.isFinite(batchN) &&
+    Number.isInteger(batchN) &&
     batchN >= 1 &&
     batchN <= 128 &&
-    Number.isFinite(imgszN) &&
+    Number.isInteger(imgszN) &&
     imgszN >= 64 &&
     imgszN <= 2048 &&
     imgszN % 32 === 0;

@@ -186,12 +186,15 @@ impl Engine {
         request: &TrainRequest,
         default_device: &str,
     ) -> Result<(), String> {
-        if self.is_running() {
-            return Err("已有训练在运行。".into());
-        }
-        {
-            let mut guard = self.0.child.lock().map_err(|_| "状态锁损坏".to_string())?;
-            *guard = None;
+        // One lock across check → spawn → store. The window command and `POST /train` can arrive
+        // together; a standalone `is_running()` followed by a separate store let both spawn, and
+        // the overwritten `Child` handle became an orphan that `stop()` could never see.
+        let mut guard = self.0.child.lock().map_err(|_| "状态锁损坏".to_string())?;
+        if let Some(child) = guard.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => *guard = None, // already finished and reaped
+                Ok(None) => return Err("已有训练在运行。".into()),
+            }
         }
 
         let data_path = PathBuf::from(&request.dataset);
@@ -231,10 +234,9 @@ impl Engine {
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
-        {
-            let mut guard = self.0.child.lock().map_err(|_| "状态锁损坏".to_string())?;
-            *guard = Some(child);
-        }
+        // Still holding `guard`: no second caller can slip a spawn in between.
+        *guard = Some(child);
+        drop(guard);
 
         if let Some(stdout) = stdout {
             let engine = self.clone();

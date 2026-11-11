@@ -10,17 +10,23 @@ pub const VERSION: &str = env!("YOLO_TRAINER_VERSION");
 
 /// Compare two `major.minor.patch` versions numerically.
 ///
-/// The updater plugin already does this internally, so why keep our own? Because a misconfigured
-/// feed (or a release whose `latest.json` was copied from an older tag) is otherwise invisible:
-/// the plugin just says "no update" and the user keeps an old build with no explanation. We check
-/// the advertised version explicitly so the settings page can say "更新源指向的是 v0.0.9，比当前还旧".
+/// Used by `updater::install()` as defence in depth: a feed copied from an older tag could
+/// otherwise pair an old (validly signed) artifact with a newer version string. `check()` relies
+/// on the plugin's own comparator; making it also explain "the feed is older" would need a second
+/// HTTPS request with our own TLS stack, which is not worth a dependency for a misconfiguration
+/// the user cannot fix from the UI anyway.
 ///
 /// **Never compare version strings lexicographically**: `"0.10.0" < "0.9.0"` is true as text and
-/// would make every release after 0.9.x look older. Missing segments count as 0; `-beta` / `+meta`
-/// suffixes are ignored because this project does not publish pre-release channels.
+/// would make every release after 0.9.x look older. Missing segments count as 0; a leading `v`
+/// (legal in the official feed format) and `-beta` / `+meta` suffixes are ignored.
 pub fn cmp_version(a: &str, b: &str) -> Ordering {
     fn parts(s: &str) -> Vec<u64> {
-        let core = s.split(['-', '+']).next().unwrap_or("");
+        let core = s
+            .trim()
+            .trim_start_matches(['v', 'V'])
+            .split(['-', '+'])
+            .next()
+            .unwrap_or("");
         core.split('.')
             .map(|part| part.trim().parse::<u64>().unwrap_or(0))
             .collect()
@@ -65,5 +71,14 @@ mod tests {
         assert_eq!(cmp_version("1.2.3-beta.1", "1.2.3"), Ordering::Equal);
         assert_eq!(cmp_version("1.2.3+build7", "1.2.4"), Ordering::Less);
         assert_eq!(cmp_version("garbage", "0.0.0"), Ordering::Equal);
+    }
+
+    /// The official updater feed allows a leading `v`; treating `v1` as 0 used to make a
+    /// genuinely newer release look older and abort the install with a contradictory message.
+    #[test]
+    fn leading_v_is_legal() {
+        assert_eq!(cmp_version("v1.0.0", "0.1.3"), Ordering::Greater);
+        assert_eq!(cmp_version("V0.2.0", "v0.1.9"), Ordering::Greater);
+        assert_eq!(cmp_version("v0.1.3", "0.1.3"), Ordering::Equal);
     }
 }

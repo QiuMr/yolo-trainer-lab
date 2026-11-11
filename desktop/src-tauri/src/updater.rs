@@ -5,9 +5,11 @@
 //! That project ships a portable zip with `bundle.active = false`, so "update" means "overwrite
 //! the install directory with a newer zip". This app ships an **NSIS installer** and registers
 //! uninstall entries, so overwriting files would leave the registry pointing at a version that
-//! no longer exists. The official plugin downloads the signed `.nsis.zip`, verifies its
-//! minisign signature and launches the real installer in passive mode — the registry, the
-//! `externalBin` engine and the uninstaller all stay consistent.
+//! no longer exists. The official plugin downloads the signed `setup.exe`, verifies its minisign
+//! signature and launches the real installer in `quiet` (`/S`) mode — the registry, the
+//! `externalBin` engine and the uninstaller all stay consistent. (NSIS builds produce a `.exe.sig`,
+//! not a `.nsis.zip`; and `passive` was measured to leave the install unfinished in a
+//! non-interactive session — see D024.)
 //!
 //! It also removes the two hardest bugs from the portable approach: a helper process that has to
 //! run before the single-instance plugin, and waiting for DLL handles to be released before
@@ -137,7 +139,7 @@ pub async fn install(app: &AppHandle) -> Result<(), String> {
     // but this makes a misconfigured feed fail loudly instead of silently downgrading.
     if crate::version::cmp_version(&update.version, crate::version::VERSION) != Ordering::Greater {
         return Err(format!(
-            "更新源指向 v{}，不比当前 v{} 新，已中止。请检查 Release 的 latest.json。",
+            "更新源指向 {}，不比当前 {} 新，已中止。请检查 Release 的 latest.json。",
             update.version,
             crate::version::VERSION
         ));

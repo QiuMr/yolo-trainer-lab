@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +24,10 @@ pub struct PredictRequest {
     pub model: Option<String>,
     /// Image file: JPEG, PNG, or WebP.
     pub source: String,
-    /// Where to write the annotated image. Defaults to the app's `predictions/` directory.
+    /// Accepted for backwards compatibility but **ignored**: the annotated image always goes to
+    /// the app's `predictions/` directory. Honouring a caller-supplied path would let a local
+    /// (token-holding) client overwrite arbitrary files or create arbitrary directories — and
+    /// writing next to a dataset image silently corrupts the next scan.
     #[serde(default)]
     pub output: Option<String>,
     #[serde(default)]
@@ -64,6 +68,35 @@ fn stem_of(path: &Path) -> String {
         .unwrap_or_else(|| "image".to_owned())
 }
 
+/// A fresh filename for every run, always inside `default_dir`. The stamp also makes
+/// `output.is_file()` a trustworthy signal: a leftover file can no longer be mistaken for the
+/// picture this particular run produced.
+fn unique_output_path(default_dir: &Path, source: &Path) -> PathBuf {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    default_dir.join(format!(
+        "{}-{}-{}-predicted.png",
+        stem_of(source),
+        std::process::id(),
+        stamp
+    ))
+}
+
+/// Only the values the engine understands; anything else falls back to CPU rather than being
+/// passed straight through as a `--device` argv value.
+fn normalise_device(value: Option<&str>) -> &'static str {
+    let value = value.map(str::trim).unwrap_or("");
+    if value.eq_ignore_ascii_case("gpu") {
+        "gpu"
+    } else if value.eq_ignore_ascii_case("auto") {
+        "auto"
+    } else {
+        "cpu"
+    }
+}
+
 /// Run inference and hand back both the structured prediction and where the picture landed.
 pub fn run(
     engine: &Path,
@@ -76,17 +109,12 @@ pub fn run(
         return Err(format!("图片不存在：{}", source.display()));
     }
 
-    let output = match request.output.as_deref() {
-        Some(path) if !path.trim().is_empty() => PathBuf::from(path),
-        _ => {
-            std::fs::create_dir_all(default_dir)
-                .map_err(|error| format!("创建输出目录失败：{error}"))?;
-            default_dir.join(format!("{}-predicted.png", stem_of(&source)))
-        }
-    };
-    if let Some(parent) = output.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("创建输出目录失败：{error}"))?;
-    }
+    // Never use `request.output`. A deterministic filename also caused a second bug: a leftover
+    // file from an earlier run made `output.is_file()` report an image this run never wrote, so a
+    // classification result could display a stale detection picture.
+    std::fs::create_dir_all(default_dir)
+        .map_err(|error| format!("创建输出目录失败：{error}"))?;
+    let output = unique_output_path(default_dir, &source);
 
     let mut command = hidden_command(engine);
     command
@@ -99,7 +127,7 @@ pub fn run(
         .arg(&output)
         .arg("--json")
         .arg("--device")
-        .arg(request.device.as_deref().unwrap_or("cpu"))
+        .arg(normalise_device(request.device.as_deref()))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
@@ -177,5 +205,28 @@ Top-1: triangle (33.42%)\n";
     #[test]
     fn returns_none_when_there_is_no_document() {
         assert!(extract_json("error: model failed to load").is_none());
+    }
+
+    #[test]
+    fn output_is_always_inside_the_app_directory_and_unique() {
+        let dir = Path::new("C:/app/predictions");
+        let source = Path::new("C:/data/images/val/img1.jpg");
+        let first = unique_output_path(dir, source);
+        let second = unique_output_path(dir, source);
+        assert!(first.starts_with(dir));
+        assert!(second.starts_with(dir));
+        assert_ne!(first, second, "a repeated run must not reuse a stale filename");
+        let name = first.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("img1-"));
+        assert!(name.ends_with("-predicted.png"));
+    }
+
+    #[test]
+    fn device_is_whitelisted() {
+        assert_eq!(normalise_device(None), "cpu");
+        assert_eq!(normalise_device(Some("GPU")), "gpu");
+        assert_eq!(normalise_device(Some(" auto ")), "auto");
+        assert_eq!(normalise_device(Some("--device")), "cpu");
+        assert_eq!(normalise_device(Some("cuda")), "cpu");
     }
 }

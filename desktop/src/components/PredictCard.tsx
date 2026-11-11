@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { ImageUp, Loader2, RefreshCw, ScanSearch, TriangleAlert } from "lucide-react";
 import { Button, Card, SectionTitle, cx } from "./ui";
@@ -41,23 +41,30 @@ export default function PredictCard({ className }: { className?: string }) {
   const [result, setResult] = useState<PredictResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Guards the whole gesture, not just the inference. `busy` only covers the engine call, so a
+   *  double-click while the file dialog is still resolving used to open a second dialog and queue
+   *  a second inference — the second answer would then land on top of the first. */
+  const picking = useRef(false);
 
   async function choose() {
-    // The browser preview has no file dialog; api.ts hands back a stand-in prediction instead, so
-    // the card can still be reviewed there.
-    const picked = isTauri
-      ? await pickImageFile()
-      : "…\\tiny-dataset\\images\\val\\img1.jpg";
-    if (!picked) return;
-    setImage(picked);
-    setResult(null);
-    setError(null);
-    setBusy(true);
+    if (picking.current) return;
+    picking.current = true;
     try {
+      // The browser preview has no file dialog; api.ts hands back a stand-in prediction instead,
+      // so the card can still be reviewed there.
+      const picked = isTauri
+        ? await pickImageFile()
+        : "…\\tiny-dataset\\images\\val\\img1.jpg";
+      if (!picked) return;
+      setImage(picked);
+      setResult(null);
+      setError(null);
+      setBusy(true);
       setResult(await predictImage({ source: picked }));
     } catch (cause) {
       setError(typeof cause === "string" ? cause : String(cause));
     } finally {
+      picking.current = false;
       setBusy(false);
     }
   }
