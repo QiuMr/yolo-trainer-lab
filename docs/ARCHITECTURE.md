@@ -59,7 +59,7 @@ GPU 驱动出问题只会杀掉引擎进程，壳活着并可以提示或重试�
 | `lib/dnd.ts` | 窗口级文件夹拖放（挂在 App 层，见 D015） |
 | `lib/toast.ts` | toast 的 pub/sub 状态 |
 | `lib/demo.ts` | 浏览器预览用的假训练数据（`?demo=1`），保证监控页无引擎也能审阅 |
-| `lib/models.ts` | 模型目录：7 个家族 × 3 个任务 × 规模档，`architectureId()` 按引擎的 `ModelId` 规则拼 ID。**这是模型名字的唯一来源**，页面不允许再手写 `"yolo26n"` 字面量 |
+| `lib/models.ts` | 模型目录：3 个家族 × 3 个任务 × 5 个规模档（45 个），`architectureId()` 按引擎的 `ModelId` 规则拼 ID。**这是模型名字的唯一来源**，页面不允许再手写 `"yolo26n"` 字面量 |
 | `components/PredictCard.tsx` | 训练完成后用一张图验证产物：调 `predict_image`，左侧标注图、右侧检出列表 |
 | `components/UpdateCard.tsx` | 设置页「版本与更新」：挂载时静默检查 + 6 h 缓存、进度事件、一键下载安装；网络失败只显示浅色句子 |
 | `App.tsx` | 外壳：标题栏 + 侧边栏 + 页面区；全局事件订阅、手势与快捷键、页面方向转场都在这一层 |
@@ -226,17 +226,20 @@ scripts/release.ps1                    GitHub Release
 上游 `research/montgomery` 的 `ModelId` 有 **73 个条目 / 7 个家族**，但"能推理"≠"能训练"。
 下列结论来自 `src/training/dispatch.rs::recipe_for` 与 CLI `TrainArgs`，不是猜测。
 
-### 可训练：63 个
+### 可训练：63 个，其中产品提供 45 个
 
-| 家族 | 规模档 | 检测 | 实例分割 | 分类 |
-| --- | --- | --- | --- | --- |
-| YOLOX | nano/tiny/s/m/l/x | 6 | — | — |
-| YOLOv3 | tinyu | 1 | — | — |
-| YOLOv8 | n/s/m/l/x | 5 | 5 | 5 |
-| YOLOv10 | n/s/m/b/l/x | 6 | — | — |
-| YOLO11 | n/s/m/l/x | 5 | 5 | 5 |
-| YOLO12 | n/s/m/l/x | 5 | — | — |
-| YOLO26 | n/s/m/l/x | 5 | 5 | 5 |
+"引擎能训"和"产品提供"是两件事。D028 把界面和 ONNX 骨架一起收窄到 45 个，
+引擎侧的 CLI 仍然认全部 63 个（没有改动，也不花体积）。
+
+| 家族 | 规模档 | 检测 | 实例分割 | 分类 | 产品提供 |
+| --- | --- | --- | --- | --- | --- |
+| YOLO26 | n/s/m/l/x | 5 | 5 | 5 | ✅ 15 |
+| YOLO11 | n/s/m/l/x | 5 | 5 | 5 | ✅ 15 |
+| YOLOv8 | n/s/m/l/x | 5 | 5 | 5 | ✅ 15 |
+| YOLOv10 | n/s/m/b/l/x | 6 | — | — | ❌ 免 NMS 已被 YOLO26 覆盖 |
+| YOLO12 | n/s/m/l/x | 5 | — | — | ❌ 注意力架构，社区零采用 |
+| YOLOX | nano/tiny/s/m/l/x | 6 | — | — | ❌ 异形档位 + 非 ultralytics 血统 |
+| YOLOv3 | tinyu | 1 | — | — | ❌ 上游标注为"对照基线" |
 
 ### 只能推理：10 个
 
@@ -258,13 +261,14 @@ COCO 与分类文件夹是引擎已有、产品未接的能力。
 
 ### UI 的开放范围
 
-选择器把 63 个可训练模型全部开放，组织方式见 `desktop/src/lib/models.ts`：
+选择器把 **45 个**模型开放（引擎能训 63 个，D028 砍掉了 18 个），组织方式见
+`desktop/src/lib/models.ts`：
 
 | 任务 | 家族数 | 模型数 | 数据集格式 | 链路 |
 | --- | --- | --- | --- | --- |
-| 检测 | 7 | 33 | `yolo` | 通 |
+| 检测 | 3（YOLO26 / YOLO11 / YOLOv8） | 15 | `yolo` | 通 |
 | 实例分割 | 3（YOLO26 / YOLO11 / YOLOv8） | 15 | `yolo` | 通（同一套 `labels/*.txt`，多边形标签由引擎解析） |
-| 图像分类 | 3 | 15 | `imagenet-folders` | 通（`train/<类名>/`，类名即标签） |
+| 图像分类 | 3（YOLO26 / YOLO11 / YOLOv8） | 15 | `imagenet-folders` | 通（`train/<类名>/`，类名即标签） |
 
 **任务与格式是一对一强制匹配**，不是建议：`taskProblem()` 在两者不匹配时给出具体原因（该换
 任务还是该换数据集），并禁用启动。三种格式的组合由 `dataset.rs` 判定，判定依据是磁盘内容

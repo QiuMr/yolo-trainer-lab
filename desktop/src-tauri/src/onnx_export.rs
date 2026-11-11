@@ -95,6 +95,33 @@ fn output_name(model: &Path) -> String {
     }
 }
 
+/// Turn the engine's load-bearing failure into something a user can act on.
+///
+/// "skeleton manifest unreadable" is what a checkpoint from an architecture outside the bundled
+/// matrix looks like — D028 dropped 18 of them, so a run trained before that change still exports
+/// into a missing file. The raw sentence names a resource path the user has never seen and says
+/// nothing about what to do, and the engine cannot do better: it only knows a file is absent, not
+/// that this architecture was never sold.
+fn explain(detail: &str) -> String {
+    let Some(rest) = detail.split("skeleton manifest unreadable at ").nth(1) else {
+        return detail.to_owned();
+    };
+    // `rsplit_once(": ")` rather than `split(':')` because a Windows path starts with `C:`.
+    let id = rest
+        .rsplit_once(": ")
+        .map(|(path, _)| path)
+        .unwrap_or(rest)
+        .rsplit(['\\', '/'])
+        .next()
+        .map(|name| name.trim_end_matches(".json"))
+        .filter(|name| !name.is_empty())
+        .unwrap_or("该");
+    format!(
+        "这个模型是「{id}」架构，当前版本不随附它的 ONNX 骨架，所以导不出来。\
+         重训一次即可：YOLO26、YOLO11、YOLOv8 都支持导出。"
+    )
+}
+
 pub fn run(
     engine: &Path,
     model: &Path,
@@ -129,7 +156,7 @@ pub fn run(
         let stderr = String::from_utf8_lossy(&result.stderr);
         let stdout = String::from_utf8_lossy(&result.stdout);
         let detail = if stderr.trim().is_empty() { stdout } else { stderr };
-        return Err(format!("导出失败：{}", detail.trim()));
+        return Err(format!("导出失败：{}", explain(detail.trim())));
     }
 
     let bytes = std::fs::metadata(&output)
@@ -164,5 +191,26 @@ mod tests {
             "the run directory is what separates today's model from yesterday's"
         );
         assert_eq!(output_name(Path::new("C:/models/custom.bpk")), "custom.onnx");
+    }
+
+    #[test]
+    fn a_dropped_architecture_names_itself_and_the_way_out() {
+        // The exact shape the engine produces, including the drive letter and the `os error`
+        // suffix — both have to survive the parsing.
+        let raw = "Error: skeleton manifest unreadable at C:\\Apps\\yolo\\resources\\onnx\\\
+                   yolox-x.json: No such file or directory (os error 2)";
+        let message = explain(raw);
+        assert!(message.contains("yolox-x"), "{message}");
+        assert!(message.contains("YOLO26"), "must say what does work: {message}");
+        assert!(
+            !message.contains("AppData") && !message.contains("C:\\"),
+            "the resource path means nothing to a user: {message}"
+        );
+    }
+
+    #[test]
+    fn unrelated_failures_keep_the_engine_wording() {
+        let raw = "Error: checkpoint declares 3 classes but the skeleton has 80";
+        assert_eq!(explain(raw), raw);
     }
 }

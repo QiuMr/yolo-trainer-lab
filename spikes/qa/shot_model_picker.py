@@ -96,23 +96,35 @@ class Session:
 
 
 def read_state(session: Session) -> dict:
-    """The picker's whole observable state, read from the DOM by role rather than by index."""
+    """The picker's whole observable state, read from the DOM by role rather than by index.
+
+    Rows are located by their label, not by position: adding "从哪开始" above the task row shifted
+    every index by one, and a positional reader would have silently reported the wrong control.
+    """
     return session.js(
         """(() => {
             const card = [...document.querySelectorAll('h3')]
                 .find(h => h.textContent.trim() === '模型').closest('div.rounded-\\\\[14px\\\\]');
             const rows = [...card.querySelectorAll('div.mt-5')];
+            const rowNamed = (label) => rows.find(row => {
+                const span = row.querySelector(':scope > div > span');
+                return span && span.textContent.trim() === label;
+            });
             const picked = (row) => {
+                if (!row) return null;
                 const btn = [...row.querySelectorAll('button')]
                     .find(b => b.getAttribute('aria-pressed') === 'true');
                 return btn ? btn.textContent.trim() : null;
             };
-            const families = rows[1] ? [...rows[1].querySelectorAll('button')] : [];
-            const scales = rows[2] ? [...rows[2].querySelectorAll('button')] : [];
+            const familyRow = rowNamed('家族');
+            const scaleRow = rowNamed('规模');
+            const families = familyRow ? [...familyRow.querySelectorAll('button')] : [];
+            const scales = scaleRow ? [...scaleRow.querySelectorAll('button')] : [];
             return {
-                task: picked(rows[0]),
-                family: picked(rows[1]),
-                scale: picked(rows[2]),
+                task: picked(rowNamed('任务')),
+                init: picked(rowNamed('从哪开始')),
+                family: picked(familyRow),
+                scale: picked(scaleRow),
                 familyCount: families.length,
                 familyLabels: families.map(b => b.textContent.trim()),
                 scaleCount: scales.length,
@@ -129,7 +141,7 @@ def read_state(session: Session) -> dict:
 def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5200
     out = sys.argv[2] if len(sys.argv) > 2 else r"E:\工作区\yolo-trainer-lab\artifacts\qa-model-picker.png"
-    url = f"http://[::1]:{port}/?page=train&demo=1"
+    url = f"http://localhost:{port}/?page=train&demo=1"
 
     proc = subprocess.Popen(
         [
@@ -163,6 +175,7 @@ def main() -> None:
         )
         assert split["id"].endswith("-seg"), split
         assert split["familyCount"] == 3, split
+        assert split["familyLabels"] == ["YOLO26最新一代", "YOLO11成熟稳定", "YOLOv8生态最广"], split
 
         session.click_attr("data-model-family", "yolov8")
         v8 = read_state(session)
@@ -178,14 +191,6 @@ def main() -> None:
         back = read_state(session)
         checks.append(f"回检测: 家族 {back['familyCount']} 个，沿用 YOLOv8 -> {back['id']}")
         assert back["id"] == "yolov8x", back
-
-        session.click_attr("data-model-family", "yolox")
-        yolox = read_state(session)
-        checks.append(
-            f"选 YOLOX（无 x 之前的 n 档）: 规模 {yolox['scaleLabels']} -> {yolox['id']}"
-        )
-        assert yolox["scaleCount"] == 6, yolox
-        assert yolox["id"].startswith("yolox-"), yolox
 
         session.click_attr("data-model-task", "classify")
         classify = read_state(session)

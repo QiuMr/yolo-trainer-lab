@@ -729,13 +729,14 @@ D026 当时没看到，这次必须记住：
 
 差异量级 = float32 舍入（融合在 f32 下做、图里 100+ 层累积）。分类输出的概率逐元素完全相同。
 
-骨架体积：detect 231–270 KiB、classify 26–38 KiB；已打包 10 个（yolov8/yolo11/yolo26 的 n/s
-detect + 2 个 classify + 2 个 segment），合计约 **2.1 MB**，生成耗时 84 秒。
+骨架体积：detect 231–270 KiB、classify 26–38 KiB。当时只打包了 10 个作为验证；
+**D028 之后按产品目录铺满 45 个**（12.06 MiB 原始，LZMA 后 35 KiB），生成耗时 9m37s。
 
 ### 覆盖面与已知限制
 
-- 只有 `tools/onnx_skeleton/generate_all.py` 的 `TARGETS` 里的架构能导出。训练了没打包的架构，
-  导出会失败并说明缺骨架——**不会产出图与权重不匹配的坏模型**。
+- 只有 `tools/onnx_skeleton/generate_all.py` 矩阵里的架构能导出，当前是 45 个（见 D028）。
+  训练了没打包的架构（引擎 CLI 仍支持的那 18 个），导出会失败并说明缺骨架——
+  **不会产出图与权重不匹配的坏模型**。
 - 骨架跟 `export spec` 版本绑定：上游图结构一变，骨架必须重新生成（`generate_all.py` 重跑一次）。
 - 只支持 fp32、`portable` profile、固定 batch/尺寸（骨架就是按这些生成的）。`end2end` 或
   `dynamic-spatial` 需要另一套骨架。
@@ -746,3 +747,68 @@ detect + 2 个 classify + 2 个 segment），合计约 **2.1 MB**，生成耗时
 
 `patches/0004-export-offline-template.patch`：`OnnxExportOptions.template` + `--template` 参数 +
 `src/export/pb.rs` + `src/export/template.rs`。**必须带 `--features training,onnx` 编译。**
+
+---
+
+## D028 · 模型目录收窄到三个家族，界面与骨架一起砍
+
+**背景**：D027 落地时安装包里只有 10 个骨架（yolov8/yolo11/yolo26 的 n/s × 三种任务里的一部分）。
+铺满全部 63 个可训练架构要 63 个骨架。用户的问题是"哪些是常用的、哪些肯定用不到，只留能用到的"。
+本次按此收窄。
+
+### 决策
+
+界面（`desktop/src/lib/models.ts`）与骨架（`tools/onnx_skeleton/generate_all.py`）**同时**收窄到：
+
+**YOLO26 / YOLO11 / YOLOv8 × 检测 / 分割 / 分类 × n / s / m / l / x = 45 个**
+
+砍掉的 18 个：
+
+| 家族 | 可训练数 | 为什么不要 |
+| --- | --- | --- |
+| YOLOv10 | 6（检测 n/s/m/b/l/x） | 唯一卖点是免 NMS，而**本产品的默认架构 YOLO26 本身就是 NMS-free 且更快**，这个家族存在的理由已经消失。`b` 档（m 与 l 之间）更是全生态独一份的冷门 |
+| YOLO12 | 5（检测 n/s/m/l/x） | 注意力架构，依赖 flash-attn，速度不如同规模 YOLO11，社区几乎没有采用 |
+| YOLOX | 6（检测 nano/tiny/s/m/l/x） | 2021 年旷视，不属于 ultralytics 生态（要单独 checkout 官方仓库）。更要命的是档位命名异形（`nano`/`tiny`），逼着选择器为它写一套特例——D020 的 `resolveSelection` 回退逻辑就是为它写的 |
+| YOLOv3-tinyu | 1（检测） | 上游自己的注释写着"对照基线"。这是开发者自查训练管线的工具，不是产品功能 |
+
+### 被否决的方案
+
+- **UI 保留 7 家族、只打包 3 家族骨架**：用户仍能选 YOLOX 训出模型，但点导出会缺骨架。
+  这会制造"能训不能导"的隐藏坑——产品契约不自洽，否决。
+- **保留全部 63**：见下面的体积实测。体积不是理由，**认知负担**才是——63 个组合里新手无法判断
+  "YOLOX nano 和 YOLO26n 有什么区别"，而这个问题没有一句话能答。
+
+### 体积：初估错了，必须更正
+
+我先按"每个骨架 250 KB × 45 ≈ 10 MB"估了个 +8~10 MB 安装包。**实测是错的**：
+
+| 项 | 数据 |
+| --- | --- |
+| 45 个骨架原始体积 | onnx 8.94 MiB + json 3.12 MiB = **12.06 MiB** |
+| 同批文件 LZMA9e solid | **35 KiB（354.7x）** |
+| 安装包 | 0.1.2 的 29.09 MiB → 0.1.3 的 **29.31 MiB（+229 KB）** |
+
+原因：`zero()` 把每个初始化器的 payload 全丢掉，骨架里剩下的只有**节点名和 dims**，45 个文件之间
+重复度极高，solid LZMA 的字典能整个吃掉。所以"多打包 18 个骨架"本来也不会让安装包涨多少。
+
+结论：**体积从来不是这个决策的约束**。以后不要再拿体积为砍架构辩护。
+
+### 代价与遗留
+
+- 引擎**没改**，CLI 仍能 `train --architecture yolox-x`。只是产品界面不提供，也不随附骨架。
+- 旧版本训出来的这 18 个架构的 run，在「导出 ONNX」时会缺骨架。`onnx_export.rs::explain()`
+  把引擎那句 `skeleton manifest unreadable at ...` 翻译成中文，点名架构并给出"重训一次"的路径。
+- 骨架清单是手动重生成的（`generate_all.py` 现在会顺手删掉矩阵外的旧骨架），与 export spec
+  版本绑定这条限制不变。
+
+### 这次改动的验证
+
+| 项 | 怎么验的 |
+| --- | --- |
+| 45 个骨架与 manifest 自洽 | 逐个用 `onnx.load` 静态核对：张量名全在 graph 里、dims 一致、输入输出 shape 一致 → 45/45 OK |
+| m 档新增骨架能端到端导出 | 训 `yolov8m`（640 输入 1 epoch）→ `export --template` 成功，167 张量，103.6 MB |
+| 导出结果与引擎推理一致 | ORT 跑同一张图：分类分数与引擎逐位一致（51.6%），x 坐标 6 个框一致到 0.1 px。y 有 78.6 px 常数差，来自引擎的 stride 对齐 rect letterbox（pad_y=11）与 ORT 侧固定 640×640（pad=75）的差别，与骨架无关 |
+| 选择器三家族 | CDP 实测：默认 `yolo26n`、切分割 `yolo26n-seg`、换 YOLOv8 `yolov8n-seg`、选 x `yolov8x-seg`、回检测 `yolov8x`、切分类阻断 → 全通过 |
+| 桌面单测 | `cargo test --lib` **40 passed**（新增 2 项：缺骨架文案、无关错误原样透传） |
+| 前端 | `tsc --noEmit` 干净、`vite build` 2.0s |
+| 安装包 | `tauri build --bundles nsis` → 29.31 MiB，staging 里 90 个资源文件 |

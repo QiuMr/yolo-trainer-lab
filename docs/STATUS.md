@@ -3,7 +3,7 @@
 ## 一句话结论
 
 **montgomery 的完整链路可用**：数据 → 训练 → 导出 `.bpk` → 推理，全部在本机跑通（CPU 后端）。
-桌面壳、AI 操控接口、63 个模型选择器、分类链路、单图推理都已闭环；本轮补上 GitHub 仓库、
+桌面壳、AI 操控接口、45 个模型选择器、分类链路、单图推理都已闭环；本轮补上 GitHub 仓库、
 版本管理与自动更新。GPU 后端在这台机器上不可靠，需换独显机器验证。
 
 ## 已实测通过
@@ -15,6 +15,29 @@
 | 训练干跑（CPU） | `train --dry-run` | ✅ `Device<Flex(Cpu)>`，forward/loss/backward 全过 |
 | 训练 1 epoch（CPU） | `train --epochs 1 --no-val` | ✅ `loss 4573.58`，产出 checkpoints + exports |
 | 训练产物推理 | `predict --model exports/best.bpk` | ✅ 正常输出检测结果、写出标注图 |
+
+## 模型目录收窄到 45 个（2026-11-11 下午）
+
+用户问"哪些常用、哪些肯定用不到"。按此把界面与 ONNX 骨架一起砍到 3 家族 × 3 任务 × 5 档，
+明细与被否决的方案见 D028。
+
+| 项目 | 状态 | 怎么验的 |
+| --- | --- | --- |
+| 界面家族 7 → 3 | ✅ | CDP 实测：检测/分割/分类下都是 `['YOLO26最新一代','YOLO11成熟稳定','YOLOv8生态最广']` |
+| 三级联动仍成立 | ✅ | 默认 `yolo26n` → 分割 `yolo26n-seg` → YOLOv8 `yolov8n-seg` → 选 x `yolov8x-seg` → 回检测 `yolov8x` |
+| 分类任务阻断 | ✅ | 切分类 ID 变 `yolov8x-cls`，同时出现警告条、启动按钮置灰 |
+| 布局未失衡 | ✅ | 截图实测：四行（从哪开始 3 / 任务 3 / 家族 3 / 规模 5）等宽铺满，家族芯片 288px 与任务行一致 |
+| `shot_model_picker.py` 行定位 | ✅ 已修 | 续训加了「从哪开始」行之后，脚本按索引取行整体偏移 1，之前一直是"通过的假象"。改成按 label 取行 |
+| 45 个骨架与 manifest 自洽 | ✅ 45/45 | `onnx.load` 静态核对：张量名全在 graph、dims 一致、输入输出 shape 一致 |
+| 新档位端到端导出 | ✅ | `yolov8m`（640/1 epoch）→ `export --template`，167 张量，103.6 MB，ORT 可执行 |
+| 导出与引擎推理一致 | ✅ | 同图同权重：分数逐位一致（51.6%），x 坐标 6 框一致到 0.1px；y 差 78.6px 来自 rect letterbox 与固定 640 的差别 |
+| 缺骨架时的提示 | ✅ | 引擎原句 `skeleton manifest unreadable at …` 翻译成中文并点名架构（新增单测 2 项） |
+| `cargo test --lib` | ✅ 40 passed / 1 ignored | 新增 2 项（缺骨架文案、无关错误原样透传） |
+| 安装包 | ✅ 29.31 MiB | 45 个骨架 12.06 MiB 原始 → LZMA 35 KiB（354.7x），比 0.1.2 只多 229 KB |
+
+**又一次估算失准**：我先按"250 KB × 45 ≈ 10 MB"说会涨到 +8~10 MB 安装包，实测只涨 0.2 MB。
+骨架把权重 payload 全丢掉，只剩重复的节点名和 dims，solid LZMA 能压到 1/355。
+体积不该再被用作砍架构的理由。
 
 ## 全面审查（2026-11-11 白天）
 
@@ -194,7 +217,7 @@ let time_measurement = if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
 
 ## 模型选择器（2026-11-10 深夜，浏览器 CDP 实测）
 
-训练页从"3 张模型卡"换成"任务 → 家族 → 规模"三级，覆盖全部 63 个可训练模型。
+训练页从"3 张模型卡"换成"任务 → 家族 → 规模"三级。当时覆盖全部 63 个可训练模型，D028 后收窄为 45 个。
 
 | 项 | 状态 | 怎么验的 |
 | --- | --- | --- |
@@ -204,7 +227,7 @@ let time_measurement = if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
 | 换家族 → ID 跟随 | ✅ | YOLOv8 → `yolov8n-seg`，规模仍 5 档 |
 | 换规模 → ID 跟随 | ✅ | 选 x → `yolov8x-seg` |
 | 切回检测 → 保留家族 | ✅ | 仍是 YOLOv8 → `yolov8x`（不重置为默认） |
-| YOLOX 的异形档位 | ✅ | 规模变 `nano/tiny/s/m/l/x` 六档，ID `yolox-x` |
+| YOLOX 的异形档位 | ✅ ~~已验证~~ | 规模变 `nano/tiny/s/m/l/x` 六档，ID `yolox-x`。**D028 已移除该家族，此项验证随之作废** |
 | 分类 → 阻断 | ✅ | ID 仍显示 `yolo26x-cls`，同时出现警告条、启动按钮置灰 |
 | 控件等宽 | ✅ | DOM 实测：任务 288×3、家族 119×7、规模 171×5 |
 | `tsc --noEmit` / `vite build` | ✅ | 干净 / 2.07s |
@@ -253,7 +276,7 @@ let time_measurement = if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
 - [x] `requireSignedVersion`——已启用：CLI 2.12.4 的签名确实带 `version:`（D023）
 - [ ] 人工过一遍拖文件夹进窗口的手势、托盘菜单
 - [x] 本地控制服务（AI 操控）——已完成
-- [x] 模型选择器（63 个全开放）——已完成
+- [x] 模型选择器（D028 后收窄为 45 个）——已完成
 - [x] 分类数据集链路（ImageNet 目录结构）——已完成
 - [x] `/predict` 单图推理端点 + 界面验证卡片——已完成
 - [x] GitHub 公开仓库 + 版本管理 + 官方 updater + 发版脚本——已完成

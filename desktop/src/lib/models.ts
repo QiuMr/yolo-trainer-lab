@@ -5,16 +5,19 @@ import type { DatasetFormat, DatasetSummary } from "./api";
 /**
  * The model catalog, mirroring montgomery's `ModelId::from_str` exactly.
  *
- * 73 ids exist upstream, but only 63 can be trained: `yolo26*-sem` and `yolo26*-depth` are
- * inference-only and the native trainer rejects them before building a loss. They are absent
- * here on purpose — a picker must not offer something that cannot run.
+ * The engine can build 63 trainable architectures: 73 ids minus `yolo26*-sem` / `yolo26*-depth`,
+ * which are inference-only and rejected before a loss is built. Only 45 are offered here. The
+ * other 18 — YOLOv10, YOLO12, YOLOX, YOLOv3-tinyu — remain trainable through the CLI but are
+ * deliberately absent from both the picker and the ONNX skeleton bundle. Reasons per family are
+ * in `docs/DECISIONS.md` D028; the short version is that none of them is what a user of this
+ * tool reaches for, and each one would ship a skeleton nobody downloads.
  *
- * The id is assembled from two parts, which is what makes one control able to cover 63 models:
+ * The id is assembled from two parts, which is what makes one control able to cover 45 models:
  *   detect   -> prefix + scale          e.g. yolo26 + n      = yolo26n
  *   segment  -> prefix + scale + "-seg" e.g. yolo26 + n      = yolo26n-seg
  *   classify -> prefix + scale + "-cls" e.g. yolo26 + n      = yolo26n-cls
- * YOLOX and YOLOv3 carry a hyphen in their prefix ("yolox-", "yolov3-"), which is why the
- * separators live in `prefix` instead of being assumed.
+ * `prefix` carries its own trailing separator, so a family whose id needs a hyphen can still be
+ * expressed even though the three bundled families happen to be separator-free.
  */
 
 export type TaskId = "detect" | "segment" | "classify";
@@ -79,7 +82,7 @@ export const TASKS: Task[] = [
 
 export type Scale = {
   id: string;
-  /** Shown large. YOLOX uses words, everyone else uses one letter. */
+  /** Shown large. One letter, always — every bundled family uses the same ladder. */
   label: string;
   /** Four characters at most: six columns still have to fit on one row. */
   note: string;
@@ -87,25 +90,6 @@ export type Scale = {
 
 const N_S_M_L_X: Scale[] = [
   { id: "n", label: "n", note: "最快" },
-  { id: "s", label: "s", note: "轻快" },
-  { id: "m", label: "m", note: "均衡" },
-  { id: "l", label: "l", note: "更准" },
-  { id: "x", label: "x", note: "最准" },
-];
-
-/** YOLOv10's `b` sits between `m` and `l`; dropping it would make the ladder lie. */
-const N_S_M_B_L_X: Scale[] = [
-  { id: "n", label: "n", note: "最快" },
-  { id: "s", label: "s", note: "轻快" },
-  { id: "m", label: "m", note: "均衡" },
-  { id: "b", label: "b", note: "均衡+" },
-  { id: "l", label: "l", note: "更准" },
-  { id: "x", label: "x", note: "最准" },
-];
-
-const YOLOX_SCALES: Scale[] = [
-  { id: "nano", label: "nano", note: "极轻" },
-  { id: "tiny", label: "tiny", note: "很小" },
   { id: "s", label: "s", note: "轻快" },
   { id: "m", label: "m", note: "均衡" },
   { id: "l", label: "l", note: "更准" },
@@ -149,38 +133,6 @@ export const FAMILIES: Family[] = [
     tasks: ["detect", "segment", "classify"],
     scales: N_S_M_L_X,
   },
-  {
-    key: "yolov10",
-    label: "YOLOv10",
-    note: "免 NMS",
-    prefix: "yolov10",
-    tasks: ["detect"],
-    scales: N_S_M_B_L_X,
-  },
-  {
-    key: "yolo12",
-    label: "YOLO12",
-    note: "注意力架构",
-    prefix: "yolo12",
-    tasks: ["detect"],
-    scales: N_S_M_L_X,
-  },
-  {
-    key: "yolox",
-    label: "YOLOX",
-    note: "Anchor-free",
-    prefix: "yolox-",
-    tasks: ["detect"],
-    scales: YOLOX_SCALES,
-  },
-  {
-    key: "yolov3",
-    label: "YOLOv3",
-    note: "对照基线",
-    prefix: "yolov3-",
-    tasks: ["detect"],
-    scales: [{ id: "tinyu", label: "tinyu", note: "极轻" }],
-  },
 ];
 
 export function architectureId(family: Family, scale: Scale, task: TaskId): string {
@@ -200,10 +152,12 @@ export type Selection = {
 /**
  * Resolve the three stored choices into a valid combination.
  *
- * The component stores the *last* family and scale the user touched, not a validated pair, so
- * switching task away and back restores the earlier chip instead of silently resetting to the
- * default. The fallback only engages when the stored value cannot exist, e.g. `n` after moving
- * from YOLO26 to YOLOX (whose smallest rung is called `nano`).
+ * The component keeps the *last* family and scale the user touched rather than a validated pair,
+ * so switching task away and back restores the earlier chip instead of silently resetting to the
+ * default. With all three families on the same ladder and present under every task, neither
+ * fallback is reachable today; they stay because this function takes raw strings and must return
+ * something renderable whatever it is handed, and because a future family with its own rungs
+ * (the way YOLOX spelled its smallest one `nano`) would need them again.
  */
 export function resolveSelection(
   taskId: TaskId,

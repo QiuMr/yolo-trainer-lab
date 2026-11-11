@@ -1,0 +1,1329 @@
+{
+  "schema": "montgomery-onnx-skeleton-v1",
+  "model_id": "yolov8m-cls",
+  "family": "yolov8",
+  "task": "classify",
+  "profile": "portable",
+  "opset": 17,
+  "base_classes": 80,
+  "input_shape": [
+    1,
+    3,
+    224,
+    224
+  ],
+  "onnx": "yolov8m-cls.onnx",
+  "tensors": [
+    {
+      "name": "model.model.9.linear.weight",
+      "dtype": "1",
+      "shape": [
+        80,
+        1280
+      ],
+      "source": {
+        "kind": "copy",
+        "key": "model.9.linear.weight"
+      },
+      "class_dependent": true
+    },
+    {
+      "name": "model.model.9.linear.bias",
+      "dtype": "1",
+      "shape": [
+        80
+      ],
+      "source": {
+        "kind": "copy",
+        "key": "model.9.linear.bias"
+      },
+      "class_dependent": true
+    },
+    {
+      "name": "model.model.0.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        48,
+        3,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.0.conv",
+        "bn": "model.0.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.0.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        48
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.0.conv",
+        "bn": "model.0.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        48,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.1.conv",
+        "bn": "model.1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.1.conv",
+        "bn": "model.1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        96,
+        1,
+        1
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.cv1.conv",
+        "bn": "model.2.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.cv1.conv",
+        "bn": "model.2.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.m.0.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        48,
+        48,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.m.0.cv1.conv",
+        "bn": "model.2.m.0.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.m.0.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        48
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.m.0.cv1.conv",
+        "bn": "model.2.m.0.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.m.0.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        48,
+        48,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.m.0.cv2.conv",
+        "bn": "model.2.m.0.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.m.0.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        48
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.m.0.cv2.conv",
+        "bn": "model.2.m.0.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.m.1.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        48,
+        48,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.m.1.cv1.conv",
+        "bn": "model.2.m.1.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.m.1.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        48
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.m.1.cv1.conv",
+        "bn": "model.2.m.1.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.m.1.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        48,
+        48,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.m.1.cv2.conv",
+        "bn": "model.2.m.1.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.m.1.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        48
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.m.1.cv2.conv",
+        "bn": "model.2.m.1.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        192,
+        1,
+        1
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.cv2.conv",
+        "bn": "model.2.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.2.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.2.cv2.conv",
+        "bn": "model.2.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.3.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        96,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.3.conv",
+        "bn": "model.3.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.3.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.3.conv",
+        "bn": "model.3.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        192,
+        1,
+        1
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.cv1.conv",
+        "bn": "model.4.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.cv1.conv",
+        "bn": "model.4.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.0.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        96,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.0.cv1.conv",
+        "bn": "model.4.m.0.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.0.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.0.cv1.conv",
+        "bn": "model.4.m.0.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.0.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        96,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.0.cv2.conv",
+        "bn": "model.4.m.0.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.0.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.0.cv2.conv",
+        "bn": "model.4.m.0.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.1.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        96,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.1.cv1.conv",
+        "bn": "model.4.m.1.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.1.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.1.cv1.conv",
+        "bn": "model.4.m.1.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.1.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        96,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.1.cv2.conv",
+        "bn": "model.4.m.1.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.1.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.1.cv2.conv",
+        "bn": "model.4.m.1.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.2.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        96,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.2.cv1.conv",
+        "bn": "model.4.m.2.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.2.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.2.cv1.conv",
+        "bn": "model.4.m.2.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.2.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        96,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.2.cv2.conv",
+        "bn": "model.4.m.2.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.2.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.2.cv2.conv",
+        "bn": "model.4.m.2.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.3.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        96,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.3.cv1.conv",
+        "bn": "model.4.m.3.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.3.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.3.cv1.conv",
+        "bn": "model.4.m.3.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.3.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        96,
+        96,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.3.cv2.conv",
+        "bn": "model.4.m.3.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.m.3.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        96
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.m.3.cv2.conv",
+        "bn": "model.4.m.3.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        576,
+        1,
+        1
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.cv2.conv",
+        "bn": "model.4.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.4.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.4.cv2.conv",
+        "bn": "model.4.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.5.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        384,
+        192,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.5.conv",
+        "bn": "model.5.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.5.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        384
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.5.conv",
+        "bn": "model.5.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        384,
+        384,
+        1,
+        1
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.cv1.conv",
+        "bn": "model.6.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        384
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.cv1.conv",
+        "bn": "model.6.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.0.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        192,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.0.cv1.conv",
+        "bn": "model.6.m.0.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.0.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.0.cv1.conv",
+        "bn": "model.6.m.0.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.0.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        192,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.0.cv2.conv",
+        "bn": "model.6.m.0.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.0.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.0.cv2.conv",
+        "bn": "model.6.m.0.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.1.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        192,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.1.cv1.conv",
+        "bn": "model.6.m.1.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.1.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.1.cv1.conv",
+        "bn": "model.6.m.1.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.1.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        192,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.1.cv2.conv",
+        "bn": "model.6.m.1.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.1.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.1.cv2.conv",
+        "bn": "model.6.m.1.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.2.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        192,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.2.cv1.conv",
+        "bn": "model.6.m.2.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.2.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.2.cv1.conv",
+        "bn": "model.6.m.2.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.2.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        192,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.2.cv2.conv",
+        "bn": "model.6.m.2.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.2.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.2.cv2.conv",
+        "bn": "model.6.m.2.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.3.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        192,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.3.cv1.conv",
+        "bn": "model.6.m.3.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.3.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.3.cv1.conv",
+        "bn": "model.6.m.3.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.3.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        192,
+        192,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.3.cv2.conv",
+        "bn": "model.6.m.3.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.m.3.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        192
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.m.3.cv2.conv",
+        "bn": "model.6.m.3.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        384,
+        1152,
+        1,
+        1
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.cv2.conv",
+        "bn": "model.6.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.6.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        384
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.6.cv2.conv",
+        "bn": "model.6.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.7.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        768,
+        384,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.7.conv",
+        "bn": "model.7.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.7.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        768
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.7.conv",
+        "bn": "model.7.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        768,
+        768,
+        1,
+        1
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.cv1.conv",
+        "bn": "model.8.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        768
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.cv1.conv",
+        "bn": "model.8.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.m.0.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        384,
+        384,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.m.0.cv1.conv",
+        "bn": "model.8.m.0.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.m.0.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        384
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.m.0.cv1.conv",
+        "bn": "model.8.m.0.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.m.0.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        384,
+        384,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.m.0.cv2.conv",
+        "bn": "model.8.m.0.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.m.0.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        384
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.m.0.cv2.conv",
+        "bn": "model.8.m.0.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.m.1.cv1.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        384,
+        384,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.m.1.cv1.conv",
+        "bn": "model.8.m.1.cv1.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.m.1.cv1.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        384
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.m.1.cv1.conv",
+        "bn": "model.8.m.1.cv1.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.m.1.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        384,
+        384,
+        3,
+        3
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.m.1.cv2.conv",
+        "bn": "model.8.m.1.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.m.1.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        384
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.m.1.cv2.conv",
+        "bn": "model.8.m.1.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.cv2.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        768,
+        1536,
+        1,
+        1
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.cv2.conv",
+        "bn": "model.8.cv2.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.8.cv2.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        768
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.8.cv2.conv",
+        "bn": "model.8.cv2.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.9.conv.conv.fused_weight",
+      "dtype": "1",
+      "shape": [
+        1280,
+        768,
+        1,
+        1
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.9.conv.conv",
+        "bn": "model.9.conv.bn",
+        "slot": "weight",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    },
+    {
+      "name": "model.model.9.conv.conv.fused_bias",
+      "dtype": "1",
+      "shape": [
+        1280
+      ],
+      "source": {
+        "kind": "conv_bn",
+        "conv": "model.9.conv.conv",
+        "bn": "model.9.conv.bn",
+        "slot": "bias",
+        "eps": 1e-05
+      },
+      "class_dependent": false
+    }
+  ],
+  "outputs": [
+    {
+      "name": "logits",
+      "shape": [
+        1,
+        80
+      ],
+      "class_dims": [
+        {
+          "dim": 1,
+          "base": 80,
+          "offset": 0
+        }
+      ]
+    },
+    {
+      "name": "probabilities",
+      "shape": [
+        1,
+        80
+      ],
+      "class_dims": [
+        {
+          "dim": 1,
+          "base": 80,
+          "offset": 0
+        }
+      ]
+    }
+  ],
+  "scalars": [],
+  "attributes": []
+}

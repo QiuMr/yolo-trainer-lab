@@ -472,7 +472,7 @@ def main() -> int:
         "attributes": class_attributes(full, narrow),
     }
     (args.out / f"{args.model_id}.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n"
     )
     print(f"{args.model_id}: {len(entries)} tensors -> {skeleton} "
           f"({skeleton.stat().st_size / 1024:.0f} KiB)")
