@@ -1,9 +1,10 @@
 import { useRef, useState } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { ImageUp, Loader2, RefreshCw, ScanSearch, TriangleAlert } from "lucide-react";
+import { FileDown, ImageUp, Loader2, RefreshCw, ScanSearch, TriangleAlert } from "lucide-react";
 import { Button, Card, SectionTitle, cx } from "./ui";
 import { Progress } from "./Motion";
-import { isTauri, pickImageFile, predictImage, type PredictResult } from "../lib/api";
+import { exportOnnx, isTauri, pickImageFile, predictImage, type PredictResult } from "../lib/api";
+import { toast } from "../lib/toast";
 
 /**
  * Post-training check: run the trained model on one image.
@@ -45,6 +46,28 @@ export default function PredictCard({ className }: { className?: string }) {
    *  double-click while the file dialog is still resolving used to open a second dialog and queue
    *  a second inference — the second answer would then land on top of the first. */
   const picking = useRef(false);
+  const [exporting, setExporting] = useState(false);
+
+  /**
+   * Hand the model over in the format every other runtime speaks.
+   *
+   * This is the reason the app exists for most people: they trained here, but they will deploy
+   * somewhere else. The file always lands in the app's own `onnx/` directory, so a second export
+   * cannot overwrite a model the user is still using.
+   */
+  async function save() {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const written = await exportOnnx();
+      toast(`已导出 ${written.classes} 类模型（${written.tensors} 个张量）`, "ok", 5000);
+      toast(written.output, "ok", 8000);
+    } catch (cause) {
+      toast(typeof cause === "string" ? cause : String(cause), "danger", 6000);
+    } finally {
+      setExporting(false);
+    }
+  }
 
   async function choose() {
     if (picking.current) return;
@@ -88,15 +111,26 @@ export default function PredictCard({ className }: { className?: string }) {
         title="验证模型"
         hint="拿一张图跑一次推理。损失下降只说明在学，看到框才算能用。"
         action={
-          <Button
-            variant="secondary"
-            icon={image ? RefreshCw : ImageUp}
-            loading={busy}
-            onClick={() => void choose()}
-            className="shrink-0"
-          >
-            {image ? "换一张" : "选一张图"}
-          </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              variant="ghost"
+              icon={FileDown}
+              loading={exporting}
+              onClick={() => void save()}
+              title="导出 ONNX，拿去 ONNX Runtime / OpenCV / TensorRT 部署"
+            >
+              导出 ONNX
+            </Button>
+            <Button
+              variant="secondary"
+              icon={image ? RefreshCw : ImageUp}
+              loading={busy}
+              onClick={() => void choose()}
+              className="shrink-0"
+            >
+              {image ? "换一张" : "选一张图"}
+            </Button>
+          </div>
         }
       />
 

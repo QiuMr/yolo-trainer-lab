@@ -246,8 +246,30 @@ export async function predictImage(
   return await invoke<PredictResult>("predict_image", { request });
 }
 
-export async function scanDataset(path: string): Promise<DatasetSummary> {
+/** Result of an offline ONNX export: the file the user can take elsewhere. */
+export type OnnxExport = {
+  output: string;
+  classes: number;
+  tensors: number;
+  bytes: number;
+};
+
+/**
+ * Write the current model as ONNX. No Python and no internet: the installer ships a weight-free
+ * graph per architecture and the engine fills it from the checkpoint.
+ *
+ * `model` is omitted for "the best model of the most recent run", which is what the button means.
+ */
+export async function exportOnnx(model?: string): Promise<OnnxExport> {
   if (!isTauri) {
+    // Preview: the shell is what writes the file, so there is nothing honest to return but a
+    // stand-in shape. Keeping it explicit stops the button from looking broken in the browser.
+    return { output: "…\\onnx\\2026-11-10-19-20-best.onnx", classes: 3, tensors: 127, bytes: 12_000_000 };
+  }
+  return await invoke<OnnxExport>("export_onnx", { request: { model: model ?? null } });
+}
+
+export async function scanDataset(path: string): Promise<DatasetSummary> {  if (!isTauri) {
     // Preview mode: return a sample so the page can be judged without an engine. The path picks
     // which layout to stand in for — the two render different cards.
     const sample = path.includes("classify")

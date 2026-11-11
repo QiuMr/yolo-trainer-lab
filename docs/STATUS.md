@@ -260,8 +260,10 @@ let time_measurement = if features.contains(wgpu::Features::TIMESTAMP_QUERY) {
 - [ ] COCO 数据集：引擎能读，扫描器不会，UI 现在明确拒绝。要接得解析 COCO JSON（含 RLE mask）
 - [ ] 分割 / 检测共用标签文件，扫描器无法区分 bbox 与多边形；如需提前拦截要解析标签内容
 - [ ] `GET /watch` 长轮询：只在需要"训练崩了立刻知道"时才做（D019）
-- [ ] **续训入口未接**：引擎支持 `--model`（微调）与 `--resume`（断点续训），壳层只拼 `--architecture`。纯 UI 缺口，需改 `TrainRequest` + `docs/API.md`（D025）
-- [ ] **ONNX 导出未做**：上游 `export --format onnx` 强制依赖 Python + ultralytics 源码，与免环境冲突。三条候选路线见 D025，等真实部署需求再定
+- [x] **续训入口**：已完成（三态：从零 / 微调 / 断点续训），`TrainRequest` 改成 tagged enum，见 D025
+- [x] **ONNX 导出**：已完成，走骨架 + 填权重，用户机器零 Python，见 D027
+- [ ] **骨架只覆盖 10 个架构**：`tools/onnx_skeleton/generate_all.py` 的 `TARGETS` 之外的架构会明确报错。要扩就加一行重跑（约 10 秒/个）
+- [ ] **骨架未随 export spec 版本自动失效**：上游图结构变了要手动重生成。如果要长期维护，应在生成时写入 spec 版本、填充时校验
 
 ## 复现命令
 

@@ -672,3 +672,22 @@ Tauri 打包时会把 sidecar 以 `montgomery.exe` 的名字放到应用 exe 旁
 - GPU 路径（本机无可用的 GPU，需独显机器）
 - `--batch -1` 自动批大小与探测的交互
 - 中断（UI 杀进程）时的 checkpoint 完整性
+
+## 2026-11-11 下午 · 免 Python 的 ONNX 导出（骨架 + 填权重）
+
+用户明确"要拿模型去别处推理，一般就是 ONNX"，所以 ONNX 导出做成用户机器零环境依赖。
+
+- **引擎**：新增 `export --template <目录>`（补丁 0004）。读预生成骨架 → 从检查点快照写权重
+  → 改形状/常量/整数属性 → 落盘。新增 `src/export/pb.rs`（手写 protobuf 编解码，零新依赖）与
+  `src/export/template.rs`（填充逻辑 + 4 个单元测试）。
+- **骨架生成**：`tools/onnx_skeleton/generate.py` 与 `generate_all.py`；已生成 10 个骨架进
+  `desktop/src-tauri/resources/onnx`（约 2.1 MB），`tauri.conf.json` 增加 `resources` 声明。
+- **桌面壳**：`onnx_export.rs`（定位骨架目录、命名产物、调用引擎）+ `export_onnx` 命令；
+  前端 `PredictCard` 增加「导出 ONNX」按钮。
+- **实测**：3 类真实检查点填 80 类骨架，与官方导出对比——yolov8n 框差异相对 9.6e-8、
+  yolo26n 1.2e-8、yolo26n-cls 概率完全一致。见 D027。
+- **纠正 D026 的一处过度结论**："回填后输出一致"当时验证的是 ONNX→ONNX，不是权重→ONNX；
+  Conv+BN 融合与 DFL 常量问题这次才暴露。
+
+回归：引擎 `cargo test --lib` 118 passed（新增 pb 3 + template 4）；桌面 `cargo test --lib`
+38 passed（新增 1）；`tsc --noEmit` 干净。

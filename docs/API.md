@@ -173,6 +173,10 @@ montgomery val --model <x.bpk> --data <dataset.yaml> [--json]
 
 # 设备自检（隐藏命令，供 --device auto 内部使用）
 montgomery __device-probe --device gpu|cpu
+
+# ONNX 导出（用户机器上走这条：不需要 Python，不联网）
+montgomery export --model <x.bpk> --format onnx --output <x.onnx> \
+    --template <骨架目录> [--force]
 ```
 
 ---
@@ -237,6 +241,23 @@ montgomery __device-probe --device gpu|cpu
 只是入口不同：窗口走 `invoke`，AI 客户端走 HTTP。
 
 `model` 省略时取当前 `RunState.best`；没有任何产物时报错"先跑一次训练"，不返回空结果。
+
+### `export_onnx(request: export::ExportRequest)` → `ExportResult`
+
+```ts
+type ExportRequest = { model?: string | null };
+type ExportResult = { output: string; classes: number; tensors: number; bytes: number };
+```
+
+把当前模型写成 ONNX，供 ONNX Runtime / OpenCV DNN / TensorRT 等下游使用。**用户机器上不需要
+Python**：安装包里带了每个架构的无权重骨架（`resources/onnx/<model>.onnx` + `.json`），壳层调用
+`montgomery export --template` 把检查点权重填进去。
+
+- `model` 省略 → 当前 `RunState.best`；没有产物时报"先跑一次训练"。
+- 产物固定在应用自己的 `onnx/` 目录，文件名 `<run>-<stem>.onnx`（带上 run 名，否则每次训练的
+  `best.onnx` 会互相覆盖）。
+- 架构没有对应骨架时**直接报错**，不会产出图与权重不匹配的模型。
+- 失败原因原文来自引擎 stderr，不要在这里改写文案。
 
 ---
 

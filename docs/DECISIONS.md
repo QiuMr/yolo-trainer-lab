@@ -670,3 +670,79 @@ yolo26n 修完通道后从 `48 wrong-shape` 变成 **0 wrong-shape，102 unexpec
 
 1. 是否改 head 对齐 ultralytics（检测可导出，已训模型作废重训）
 2. yolo26 双头怎么办：单独适配 keymap + Python 侧建双头图，或把 yolo26 排除在 ONNX 支持之外
+
+---
+
+## D027 · 免 Python 的 ONNX 导出：骨架 + 填权重，已实测通过
+
+**背景**：D025/D026 之后用户明确"用这个软件的人就是要拿模型去别处推理，一般就是 ONNX"，
+所以必须做成**用户机器上不需要 Python**。本条目记录最终方案与实测证据。
+
+### 先纠正 D026 里一句说过头的话
+
+D026 写的是"回填原始权重后输出一致 → 方案成立"。**那个实验是 ONNX 回填 ONNX，不是权重文件回填 ONNX**，
+所以它只证明了"清零不改变图结构"，没证明"`.bpk` 的权重能放进图里"。真实链路有两个坑，
+D026 当时没看到，这次必须记住：
+
+1. **导出时 Conv+BN 已融合**：113/127 个初始化器叫 `onnx::Conv_*`（匿名），并且数值是
+   `w * gamma / sqrt(var + eps)`，不是检查点里的原始张量。所以填充器必须自己做融合，
+   而且 eps **不是常量**（`BnFlavor`：Ultralytics 1e-3、YOLOv8-cls 1e-5），要按家族记录。
+2. **DFL 不是可学习参数**：`dfl.conv.weight` 在推理图里是固定的 `[0, 1, ..., 15]`，
+   Burn 侧没有这个参数、检查点里也不写。骨架必须**保留它的真实字节**，否则所有框距离整体偏移。
+
+### 类别数会从三个地方泄漏进图里
+
+这是最花时间的一段。三类机制必须同时处理，只改其中一类会得到"能加载但输出错"的模型：
+
+| 机制 | 例子 | 处理方式 |
+| --- | --- | --- |
+| 张量形状 | `cv3.*.2.weight` `[80,80,1,1]`、分类塔宽度 `max(p3, min(nc,100))` | 形状直接取自检查点张量 |
+| `Constant` 节点的值 | `Slice` 终点 `4+nc`（84→7）、`Reshape` 的 `[1, nc, -1]` | 生成时对比 nc 与 nc-1 找出可变元素，填充时按类别差平移 |
+| 节点整数属性 | 深度可分离塔的 `Conv.group` = 塔宽 | 同上找出，但**取值来自权重输出通道数**，不是 `nc`（塔宽是 `max(p3, nc)`，和 nc 不等） |
+
+最后一行是踩过的坑：一开始把 `group` 也按类别差平移，yolo26 直接报
+`Input channels C is not equal to kernel channels * group. C: 64 kernel channels: 1 group: 3`。
+
+### 方案
+
+- **骨架**：`tools/onnx_skeleton/generate.py` 在开发机用 torch 导出一张图，把权重清零
+  （只留 name/dtype/dims），把融合权重改名成 `<模块>.conv.fused_weight` 并记录融合配方
+  （含 eps），把随类别数变化的张量标 `class_dependent`，最后输出 `<model>.onnx` + `<model>.json`。
+  生成时对每个参数加极小扰动：随机初始化会让所有 BN 融合偏置恰好为 0，torch 会把它们折叠成
+  **一个共享常量 + 一堆 Identity 节点**，那不是真实检查点会产生的图。
+- **填充**：引擎 `export --template <dir>`（补丁 0004）。读骨架 → 读检查点快照（复用
+  `snapshot::write_snapshot`，名字映射沿用 `keymap`）→ 逐个初始化器写字节 → 改输出维度 →
+  改 `Constant` / 整数属性 → 落盘。全程 Rust，无 Python、无联网。
+- **protobuf**：手写极简编解码（`src/export/pb.rs`，~200 行）。理由一是两条消息不值得引 codegen
+  依赖，二是本机 `CARGO_HOME` 在 D 盘且 D 盘已满，`cargo fetch` 装不了新 crate（实测
+  `os error 112`）。未知字段原样保留，只重编码认识的字段。
+
+### 实测（本机 CPU，ORT 1.23.2，单张随机输入）
+
+用**真实的 3 类检查点**填**80 类骨架**，与官方 Python 导出对比：
+
+| 模型 | 产物 | 框/输出 1 | 分数/输出 2 |
+| --- | --- | --- | --- |
+| yolov8n detect（3 类） | 12.26 MB | max 6.10e-5（相对 9.6e-8） | max 5.96e-8 |
+| yolo26n detect（3 类） | 9.78 MB | max 7.63e-6（相对 1.2e-8） | max 2.98e-8 |
+| yolo26n-cls（3 类） | 6.16 MB | logits max 5.59e-9 | probabilities **0.000e+00** |
+
+差异量级 = float32 舍入（融合在 f32 下做、图里 100+ 层累积）。分类输出的概率逐元素完全相同。
+
+骨架体积：detect 231–270 KiB、classify 26–38 KiB；已打包 10 个（yolov8/yolo11/yolo26 的 n/s
+detect + 2 个 classify + 2 个 segment），合计约 **2.1 MB**，生成耗时 84 秒。
+
+### 覆盖面与已知限制
+
+- 只有 `tools/onnx_skeleton/generate_all.py` 的 `TARGETS` 里的架构能导出。训练了没打包的架构，
+  导出会失败并说明缺骨架——**不会产出图与权重不匹配的坏模型**。
+- 骨架跟 `export spec` 版本绑定：上游图结构一变，骨架必须重新生成（`generate_all.py` 重跑一次）。
+- 只支持 fp32、`portable` profile、固定 batch/尺寸（骨架就是按这些生成的）。`end2end` 或
+  `dynamic-spatial` 需要另一套骨架。
+- 大模型（s 以上）没逐个验证，但走的是同一条代码路径，且 `verify()` 会比对每个非类别相关张量的
+  形状，对不上直接报错而不是静默产出。
+
+### 补丁 0004
+
+`patches/0004-export-offline-template.patch`：`OnnxExportOptions.template` + `--template` 参数 +
+`src/export/pb.rs` + `src/export/template.rs`。**必须带 `--features training,onnx` 编译。**

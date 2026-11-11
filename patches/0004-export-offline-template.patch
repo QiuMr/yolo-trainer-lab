@@ -1,0 +1,1574 @@
+diff --git a/src/export/mod.rs b/src/export/mod.rs
+index 4bf3dfb..1fc04cd 100644
+--- a/src/export/mod.rs
++++ b/src/export/mod.rs
+@@ -7,8 +7,10 @@
+ 
+ mod keymap;
+ mod manifest;
++mod pb;
+ mod snapshot;
+ pub mod spec;
++mod template;
+ 
+ use std::{
+     env, fs,
+@@ -51,6 +53,9 @@ pub struct OnnxExportOptions {
+     pub keep_intermediate: bool,
+     pub reproducible: bool,
+     pub checkpoint_state: CheckpointState,
++    /// Directory of pre-generated skeletons. When set, the graph comes from there and no Python is
++    /// involved at all — this is the path shipped to users.
++    pub template: Option<PathBuf>,
+ }
+ 
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+@@ -78,6 +83,7 @@ impl OnnxExportOptions {
+             keep_intermediate: false,
+             reproducible: false,
+             checkpoint_state: CheckpointState::Ema,
++            template: None,
+         }
+     }
+ }
+@@ -103,7 +109,29 @@ fn export_onnx_inner(
+     weights: &Path,
+     mut options: OnnxExportOptions,
+ ) -> Result<OnnxArtifact> {
+-    let spec = ExportSpec::for_model(model_id);
++    let mut spec = ExportSpec::for_model(model_id);
++    // `for_model` only knows the upstream defaults — 80 for COCO, 1000 for ImageNet, 19 for
++    // Cityscapes. A model trained on a user's own dataset almost never has those counts, and the
++    // Python adapter sizes the head from `num_classes`, so an unadjusted spec rebuilds a 1000-wide
++    // classifier for a 3-class checkpoint and dies in the state-dict audit with
++    // "0 missing, 0 unexpected, 2 wrong-shape keys". The checkpoint's own class table is the only
++    // correct source.
++    if matches!(
++        spec.task,
++        ExportTask::Detect | ExportTask::Segment | ExportTask::Classify
++    ) {
++        if let Ok(metadata) = crate::artifact_metadata(weights) {
++            if let Some(names) = metadata.class_names.as_ref().filter(|names| !names.is_empty()) {
++                spec.num_classes = names.len();
++            }
++        }
++    }
++    // Offline path: a pre-generated skeleton already holds the graph, so the export needs neither
++    // Python nor the Ultralytics source. Everything below this branch is the development-time path.
++    if let Some(directory) = options.template.clone() {
++        return export_from_template(weights, &options, spec, &directory);
++    }
++
+     validate_options(spec, weights, &mut options)?;
+     let output = absolute_path(&options.output)?;
+     let sidecar = sidecar_path(&output);
+@@ -172,6 +200,58 @@ fn export_onnx_inner(
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
++fn export_from_template(
++    weights: &Path,
++    options: &OnnxExportOptions,
++    spec: ExportSpec,
++    directory: &Path,
++) -> Result<OnnxArtifact> {
++    let output = absolute_path(&options.output)?;
++    let sidecar = sidecar_path(&output);
++    refuse_or_validate_targets(&output, &sidecar, &external_data_path(&output), options.force)?;
++
++    let checkpoint = weights.to_owned();
++    let target = output.clone();
++    let skeletons = directory.to_owned();
++    let classes = spec.num_classes;
++    let report = std::thread::Builder::new()
++        .name("montgomery-onnx-fill".into())
++        .stack_size(128 * 1024 * 1024)
++        .spawn(move || -> Result<template::RenderReport> {
++            let predictor =
++                crate::Predictor::from_checkpoint(spec.model_id, checkpoint, PredictOptions::default())
++                    .map_err(|error| format!("checkpoint loading failed: {error}"))?;
++            template::render(&predictor, spec, &skeletons, classes, &target)
++        })?
++        .join()
++        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
++            "ONNX fill worker panicked".into()
++        })??;
++
++    let bytes = fs::metadata(&output)?.len();
++    let sha256 = sha256_file(&output)?;
++    let record = serde_json::json!({
++        "schema": "montgomery-onnx-offline-export-v1",
++        "model_id": report.model_id,
++        "model": output.display().to_string(),
++        "classes": report.classes,
++        "tensors": report.tensors_written,
++        "bytes": bytes,
++        "sha256": sha256,
++        "note": "Graph taken from the bundled skeleton; weights written from the checkpoint. \
++                 No Python or Ultralytics source was used.",
++    });
++    fs::write(&sidecar, serde_json::to_string_pretty(&record)?)?;
++
++    Ok(OnnxArtifact {
++        path: output,
++        sidecar,
++        external_data: None,
++        sha256,
++        bytes,
++    })
++}
++
+ fn export_staged(
+     model_id: ModelId,
+     weights: &Path,
+diff --git a/src/export/pb.rs b/src/export/pb.rs
+new file mode 100644
+index 0000000..5eb49f7
+--- /dev/null
++++ b/src/export/pb.rs
+@@ -0,0 +1,169 @@
++//! Just enough protobuf to rewrite an ONNX file.
++//!
++//! The offline exporter has to replace initializer payloads and resize a handful of dimensions.
++//! ONNX is protobuf, but pulling in a codegen crate for two messages is a large dependency for a
++//! small edit, and every added crate has to be rebuilt on each release. This module keeps the
++//! unknown fields verbatim and only re-encodes the ones the exporter understands.
++//!
++//! Encoding is canonical (sorted keys is *not* required by the wire format, so field order is
++//! preserved as read). Nothing here validates the schema.
++
++use crate::Result;
++
++/// A decoded field value. `Bytes` holds the payload, not the length prefix.
++#[derive(Debug, Clone, PartialEq)]
++pub enum Value {
++    Varint(u64),
++    Fixed32([u8; 4]),
++    Fixed64([u8; 8]),
++    Bytes(Vec<u8>),
++}
++
++impl Value {
++    pub fn as_bytes(&self) -> Option<&[u8]> {
++        match self {
++            Self::Bytes(value) => Some(value),
++            _ => None,
++        }
++    }
++
++    #[cfg(test)]
++    pub fn as_varint(&self) -> Option<u64> {
++        match self {
++            Self::Varint(value) => Some(*value),
++            _ => None,
++        }
++    }
++}
++
++fn read_varint(buf: &[u8], cursor: &mut usize) -> Result<u64> {
++    let mut value = 0u64;
++    let mut shift = 0;
++    loop {
++        let byte = *buf
++            .get(*cursor)
++            .ok_or("protobuf: truncated varint")?;
++        *cursor += 1;
++        value |= u64::from(byte & 0x7f) << shift;
++        if byte & 0x80 == 0 {
++            return Ok(value);
++        }
++        shift += 7;
++        if shift >= 64 {
++            return Err("protobuf: varint longer than 64 bits".into());
++        }
++    }
++}
++
++fn write_varint(out: &mut Vec<u8>, mut value: u64) {
++    loop {
++        let byte = (value & 0x7f) as u8;
++        value >>= 7;
++        if value == 0 {
++            out.push(byte);
++            return;
++        }
++        out.push(byte | 0x80);
++    }
++}
++
++pub fn parse(buf: &[u8]) -> Result<Vec<(u32, Value)>> {
++    let mut fields = Vec::new();
++    let mut cursor = 0usize;
++    while cursor < buf.len() {
++        let key = read_varint(buf, &mut cursor)?;
++        let field = (key >> 3) as u32;
++        let wire = (key & 7) as u8;
++        let value = match wire {
++            0 => Value::Varint(read_varint(buf, &mut cursor)?),
++            1 => {
++                let slice = buf
++                    .get(cursor..cursor + 8)
++                    .ok_or("protobuf: truncated fixed64")?;
++                cursor += 8;
++                let mut bytes = [0u8; 8];
++                bytes.copy_from_slice(slice);
++                Value::Fixed64(bytes)
++            }
++            2 => {
++                let length = read_varint(buf, &mut cursor)? as usize;
++                let slice = buf
++                    .get(cursor..cursor + length)
++                    .ok_or("protobuf: truncated length-delimited field")?;
++                cursor += length;
++                Value::Bytes(slice.to_vec())
++            }
++            5 => {
++                let slice = buf
++                    .get(cursor..cursor + 4)
++                    .ok_or("protobuf: truncated fixed32")?;
++                cursor += 4;
++                let mut bytes = [0u8; 4];
++                bytes.copy_from_slice(slice);
++                Value::Fixed32(bytes)
++            }
++            other => return Err(format!("protobuf: unsupported wire type {other}").into()),
++        };
++        if field == 0 {
++            return Err("protobuf: field number zero".into());
++        }
++        fields.push((field, value));
++    }
++    Ok(fields)
++}
++
++pub fn encode(fields: &[(u32, Value)]) -> Vec<u8> {
++    let mut out = Vec::new();
++    for (field, value) in fields {
++        match value {
++            Value::Varint(number) => {
++                write_varint(&mut out, u64::from(*field) << 3);
++                write_varint(&mut out, *number);
++            }
++            Value::Fixed64(bytes) => {
++                write_varint(&mut out, (u64::from(*field) << 3) | 1);
++                out.extend_from_slice(bytes);
++            }
++            Value::Bytes(bytes) => {
++                write_varint(&mut out, (u64::from(*field) << 3) | 2);
++                write_varint(&mut out, bytes.len() as u64);
++                out.extend_from_slice(bytes);
++            }
++            Value::Fixed32(bytes) => {
++                write_varint(&mut out, (u64::from(*field) << 3) | 5);
++                out.extend_from_slice(bytes);
++            }
++        }
++    }
++    out
++}
++
++pub fn string_field(fields: &[(u32, Value)], field: u32) -> Option<String> {
++    fields
++        .iter()
++        .find(|(number, _)| *number == field)
++        .and_then(|(_, value)| value.as_bytes())
++        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn round_trips_every_wire_type() {
++        let fields = vec![
++            (1u32, Value::Varint(300)),
++            (2, Value::Bytes(b"hello".to_vec())),
++            (3, Value::Fixed32([1, 2, 3, 4])),
++            (4, Value::Fixed64([0, 0, 0, 0, 0, 0, 0, 1])),
++        ];
++        assert_eq!(parse(&encode(&fields)).unwrap(), fields);
++    }
++
++    #[test]
++    fn rejects_truncated_payloads() {
++        assert!(parse(&[0x0a, 0x05, 0x00]).is_err());
++        assert!(parse(&[0x08]).is_err());
++    }
++}
+diff --git a/src/export/template.rs b/src/export/template.rs
+new file mode 100644
+index 0000000..e6cd07e
+--- /dev/null
++++ b/src/export/template.rs
+@@ -0,0 +1,915 @@
++//! Offline ONNX export: fill a pre-generated skeleton with the checkpoint's weights.
++//!
++//! Python is only needed to *build* the graph, never to fill it: the graph structure is fully
++//! determined by the architecture, while the class count only changes a few dimensions. The
++//! skeleton therefore ships inside the installer (structure only, a few hundred kilobytes) and this
++//! module writes the trained parameters into it, in Rust, with no export environment at all.
++//!
++//! Two details make this more than a byte copy:
++//!
++//! * The graph was exported with Conv+BN fusion, so the weights it expects are
++//!   `w * gamma / sqrt(var + eps)` with a folded bias, not the checkpoint's raw tensors. The
++//!   skeleton records the pairing and the BatchNorm epsilon, which is not a global constant
++//!   (Ultralytics uses 1e-3, the YOLOv8 classification pipeline 1e-5).
++//! * Tensors whose shape follows the class count are marked in the skeleton. Their dimensions are
++//!   taken from the checkpoint instead of the skeleton, which is what lets one skeleton serve every
++//!   dataset.
++
++use std::{collections::HashMap, fs, path::Path};
++
++use burn_store::{ModuleStore, SafetensorsStore};
++use serde::Deserialize;
++
++use crate::{Predictor, Result};
++
++use super::{
++    pb,
++    spec::{ExportSpec, ExportTask},
++};
++
++#[derive(Debug, Deserialize)]
++struct Manifest {
++    schema: String,
++    model_id: String,
++    task: String,
++    base_classes: usize,
++    onnx: String,
++    tensors: Vec<TensorPlan>,
++    outputs: Vec<OutputPlan>,
++    /// Constants whose value follows the class count (a `Slice` end of `4 + nc`, a `Reshape` shape
++    /// of `[1, nc, -1]`). They are values, not dimensions, so they need their own patch step.
++    #[serde(default)]
++    scalars: Vec<ScalarPlan>,
++    /// Integer node attributes that follow the class count. A depthwise classification tower makes
++    /// `Conv.group` equal the tower width, which is an attribute and not a tensor.
++    #[serde(default)]
++    attributes: Vec<AttributePlan>,
++}
++
++#[derive(Debug, Deserialize)]
++struct AttributePlan {
++    node: String,
++    name: String,
++    values: Vec<i64>,
++    class_dependent: Vec<bool>,
++    /// `delta` shifts by the class delta; `weight_out_channels` takes the value from the weight's
++    /// output-channel count, which is what a depthwise convolution's `group` means.
++    #[serde(default = "default_rule")]
++    rule: String,
++}
++
++fn default_rule() -> String {
++    "delta".to_owned()
++}
++
++#[derive(Debug, Deserialize)]
++struct ScalarPlan {
++    node: String,
++    /// Values in the skeleton, i.e. at `base_classes`.
++    values: Vec<i64>,
++    /// Which elements move with the class count.
++    class_dependent: Vec<bool>,
++}
++
++#[derive(Debug, Deserialize)]
++struct TensorPlan {
++    name: String,
++    dtype: String,
++    shape: Vec<i64>,
++    #[serde(default)]
++    class_dependent: bool,
++    source: Source,
++}
++
++#[derive(Debug, Deserialize)]
++#[serde(tag = "kind", rename_all = "snake_case")]
++enum Source {
++    /// Copy an existing SafeTensors entry unchanged.
++    Copy { key: String },
++    /// A constant of the inference graph that no checkpoint carries (the DFL projection is a fixed
++    /// 1x1 of ones). The skeleton keeps its real bytes, so the fill must leave it alone.
++    Constant,
++    /// Rebuild a parameter that torch fused out of a Conv and its BatchNorm.
++    ConvBn {
++        conv: String,
++        bn: String,
++        slot: String,
++        eps: f32,
++    },
++}
++
++#[derive(Debug, Deserialize)]
++struct OutputPlan {
++    name: String,
++    #[serde(default)]
++    class_dims: Vec<ClassDim>,
++}
++
++#[derive(Debug, Deserialize)]
++struct ClassDim {
++    dim: usize,
++    /// Dimension value in the skeleton, i.e. what it is at `base_classes`.
++    base: i64,
++}
++
++#[derive(Debug, serde::Serialize)]
++pub struct RenderReport {
++    pub model_id: String,
++    pub classes: usize,
++    pub tensors_written: usize,
++    pub output: String,
++}
++
++/// Protobuf field numbers, from `onnx.proto`. Only the ones this module rewrites are named.
++const MODEL_GRAPH: u32 = 7;
++const GRAPH_NODE: u32 = 1;
++const GRAPH_INITIALIZER: u32 = 5;
++const GRAPH_OUTPUT: u32 = 12;
++const TENSOR_DIMS: u32 = 1;
++const TENSOR_DATA_TYPE: u32 = 2;
++const TENSOR_NAME: u32 = 8;
++const TENSOR_RAW_DATA: u32 = 9;
++/// Typed payload fields and external-data references that must go once `raw_data` carries the
++/// tensor; leaving them behind would keep a stale copy of the weights inside the file.
++const TENSOR_TYPED_PAYLOADS: [u32; 7] = [4, 5, 6, 7, 10, 11, 13];
++const TENSOR_DATA_LOCATION: u32 = 14;
++const VALUE_INFO_NAME: u32 = 1;
++const VALUE_INFO_TYPE: u32 = 2;
++const TYPE_TENSOR: u32 = 1;
++const TENSOR_TYPE_SHAPE: u32 = 2;
++const SHAPE_DIM: u32 = 1;
++const DIM_VALUE: u32 = 1;
++
++const NODE_INPUT: u32 = 1;
++const NODE_NAME: u32 = 3;
++const NODE_OP_TYPE: u32 = 4;
++const NODE_ATTRIBUTE: u32 = 5;
++const ATTRIBUTE_NAME: u32 = 1;
++const ATTRIBUTE_TENSOR: u32 = 5;
++const TENSOR_INT64_DATA: u32 = 7;
++/// `AttributeProto.i` (single INT) and `.ints` (repeated INT).
++const ATTRIBUTE_INT: u32 = 3;
++const ATTRIBUTE_INTS: u32 = 8;
++const ATTRIBUTE_TYPE: u32 = 20;
++const ATTRIBUTE_TYPE_INT: u32 = 2;
++const ATTRIBUTE_TYPE_INTS: u32 = 7;
++
++const FLOAT_DATA_TYPE: u64 = 1;
++
++/// Task names match the skeleton manifest, which is generated by the Python adapter.
++fn task_name(task: ExportTask) -> &'static str {
++    match task {
++        ExportTask::Detect => "detect",
++        ExportTask::Segment => "segment",
++        ExportTask::Semantic => "semantic",
++        ExportTask::Depth => "depth",
++        ExportTask::Classify => "classify",
++    }
++}
++
++/// A tensor as it arrives from the checkpoint snapshot: shape and little-endian float32 payload.
++struct Source2 {
++    shape: Vec<i64>,
++    bytes: Vec<u8>,
++}
++
++/// Write `output` by filling the skeleton named by the manifest in `directory`.
++pub fn render(
++    predictor: &Predictor,
++    spec: ExportSpec,
++    directory: &Path,
++    num_classes: usize,
++    output: &Path,
++) -> Result<RenderReport> {
++    let manifest_path = directory.join(format!("{}.json", spec.model_id.as_str()));
++    let manifest: Manifest = serde_json::from_str(&fs::read_to_string(&manifest_path).map_err(
++        |error| format!("skeleton manifest unreadable at {}: {error}", manifest_path.display()),
++    )?)
++    .map_err(|error| format!("skeleton manifest {} is malformed: {error}", manifest_path.display()))?;
++
++    if manifest.schema != "montgomery-onnx-skeleton-v1" {
++        return Err(format!("unexpected skeleton schema {}", manifest.schema).into());
++    }
++    if manifest.model_id != spec.model_id.as_str() {
++        return Err(format!(
++            "skeleton is for {} but the checkpoint is {}",
++            manifest.model_id,
++            spec.model_id.as_str()
++        )
++        .into());
++    }
++    let expected_task = task_name(spec.task);
++    if manifest.task != expected_task {
++        return Err(format!(
++            "skeleton is for task {} but the checkpoint is {expected_task}",
++            manifest.task
++        )
++        .into());
++    }
++
++    let snapshot = std::env::temp_dir().join(format!(
++        "montgomery-skeleton-fill-{}.safetensors",
++        std::process::id()
++    ));
++    super::snapshot::write_snapshot(predictor, &snapshot, spec)?;
++    let weights = read_tensors(&snapshot)?;
++    let _ = fs::remove_file(&snapshot);
++
++    let skeleton_path = directory.join(&manifest.onnx);
++    let bytes = fs::read(&skeleton_path)
++        .map_err(|error| format!("skeleton unreadable at {}: {error}", skeleton_path.display()))?;
++    let filled = fill(&bytes, &manifest, &weights, num_classes)?;
++    if let Some(parent) = output.parent() {
++        fs::create_dir_all(parent)?;
++    }
++    fs::write(output, &filled)?;
++
++    Ok(RenderReport {
++        model_id: manifest.model_id.clone(),
++        classes: num_classes,
++        tensors_written: manifest.tensors.len(),
++        output: output.display().to_string(),
++    })
++}
++
++fn read_tensors(path: &Path) -> Result<HashMap<String, Source2>> {
++    let mut store = SafetensorsStore::from_file(path);
++    let tensors = store
++        .get_all_tensors()
++        .map_err(|error| format!("cannot read the parameter snapshot: {error}"))?;
++    let mut map = HashMap::with_capacity(tensors.len());
++    for (name, tensor) in tensors.iter() {
++        let data = burn_store::bridge::to_data(tensor)
++            .map_err(|error| format!("snapshot tensor {name} is not readable: {error}"))?;
++        map.insert(
++            name.clone(),
++            Source2 {
++                shape: tensor.shape.iter().map(|dimension| *dimension as i64).collect(),
++                bytes: data.as_bytes().to_vec(),
++            },
++        );
++    }
++    Ok(map)
++}
++
++fn fill(
++    skeleton: &[u8],
++    manifest: &Manifest,
++    weights: &HashMap<String, Source2>,
++    num_classes: usize,
++) -> Result<Vec<u8>> {
++    let mut model = pb::parse(skeleton)?;
++    let graph_at = model
++        .iter()
++        .position(|(field, _)| *field == MODEL_GRAPH)
++        .ok_or("skeleton has no graph")?;
++    let graph = pb::parse(
++        model[graph_at]
++            .1
++            .as_bytes()
++            .ok_or("skeleton graph is not length-delimited")?,
++    )?;
++
++    let plans: HashMap<&str, &TensorPlan> =
++        manifest.tensors.iter().map(|plan| (plan.name.as_str(), plan)).collect();
++    let mut rewritten_tensors = HashMap::with_capacity(manifest.tensors.len());
++    for plan in &manifest.tensors {
++        if matches!(plan.source, Source::Constant) {
++            continue;
++        }
++        let (dims, data) = materialise(plan, weights, num_classes)?;
++        rewritten_tensors.insert(plan.name.as_str(), (dims, data));
++    }
++
++    let output_plans: HashMap<&str, &OutputPlan> =
++        manifest.outputs.iter().map(|plan| (plan.name.as_str(), plan)).collect();
++    let mut rewritten_outputs = HashMap::new();
++    for plan in &manifest.outputs {
++        if plan.class_dims.is_empty() {
++            continue;
++        }
++        rewritten_outputs.insert(plan.name.as_str(), plan);
++    }
++
++    let mut rebuilt = Vec::with_capacity(graph.len());
++    let mut written = 0usize;
++    let mut patched_outputs = 0usize;
++    let mut patched_scalars = 0usize;
++    let mut patched_attributes = 0usize;
++    for (field, value) in graph {
++        match field {
++            GRAPH_NODE if !manifest.scalars.is_empty() || !manifest.attributes.is_empty() => {
++                let raw = value.as_bytes().ok_or("node is not length-delimited")?;
++                let node = pb::parse(raw)?;
++                let name = pb::string_field(&node, NODE_NAME).unwrap_or_default();
++                let scalar = manifest.scalars.iter().find(|plan| plan.node == name);
++                let attributes = manifest
++                    .attributes
++                    .iter()
++                    .filter(|plan| plan.node == name)
++                    .collect::<Vec<_>>();
++                if scalar.is_none() && attributes.is_empty() {
++                    rebuilt.push((field, value));
++                } else {
++                    // A depthwise convolution's `group` equals its weight's output-channel count,
++                    // which is only known once the initializer has been materialised.
++                    // `node.input` is repeated; the weight is the second entry, the first is the
++                    // activation coming in.
++                    let weight = node
++                        .iter()
++                        .filter(|(number, _)| *number == NODE_INPUT)
++                        .filter_map(|(_, value)| value.as_bytes())
++                        .nth(1)
++                        .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
++                    let channels = weight
++                        .and_then(|name| rewritten_tensors.get(name.as_str()).map(|(dims, _)| dims[0]));
++                    rebuilt.push((
++                        field,
++                        pb::Value::Bytes(rewrite_node(
++                            raw,
++                            scalar,
++                            &attributes,
++                            manifest,
++                            num_classes,
++                            channels,
++                        )?),
++                    ));
++                    if scalar.is_some() {
++                        patched_scalars += 1;
++                    }
++                    patched_attributes += attributes.len();
++                }
++            }
++            GRAPH_INITIALIZER => {
++                let raw = value.as_bytes().ok_or("initializer is not length-delimited")?;
++                let name = pb::string_field(&pb::parse(raw)?, TENSOR_NAME)
++                    .ok_or("initializer without a name")?;
++                let plan = plans
++                    .get(name.as_str())
++                    .ok_or_else(|| format!("skeleton tensor {name} has no fill plan"))?;
++                if matches!(plan.source, Source::Constant) {
++                    rebuilt.push((field, value));
++                    written += 1;
++                    continue;
++                }
++                let (dims, data) = rewritten_tensors
++                    .get(name.as_str())
++                    .ok_or("fill plan produced no tensor")?;
++                verify(&name, plan, dims)?;
++                rebuilt.push((field, pb::Value::Bytes(rewrite_tensor(raw, dims, data)?)));
++                written += 1;
++            }
++            GRAPH_OUTPUT => {
++                let raw = value.as_bytes().ok_or("graph output is not length-delimited")?;
++                let name = pb::string_field(&pb::parse(raw)?, VALUE_INFO_NAME).unwrap_or_default();
++                match output_plans.get(name.as_str()) {
++                    Some(plan) if plan.class_dims.is_empty() => rebuilt.push((field, value)),
++                    Some(plan) => {
++                        rebuilt.push((
++                            field,
++                            pb::Value::Bytes(rewrite_output(raw, plan, manifest, num_classes)?),
++                        ));
++                        patched_outputs += 1;
++                    }
++                    None => rebuilt.push((field, value)),
++                }
++            }
++            _ => rebuilt.push((field, value)),
++        }
++    }
++
++    if written != manifest.tensors.len() {
++        return Err(format!(
++            "skeleton lists {} tensors but the graph holds {written}",
++            manifest.tensors.len()
++        )
++        .into());
++    }
++    if patched_scalars != manifest.scalars.len() {
++        return Err(format!(
++            "skeleton declares {} class-dependent constants but {} were found",
++            manifest.scalars.len(),
++            patched_scalars
++        )
++        .into());
++    }
++    if patched_attributes != manifest.attributes.len() {
++        return Err(format!(
++            "skeleton declares {} class-dependent attributes but {} were found",
++            manifest.attributes.len(),
++            patched_attributes
++        )
++        .into());
++    }
++    if patched_outputs != rewritten_outputs.len() {
++        return Err(format!(
++            "skeleton declares {} class-dependent outputs but {} were found",
++            rewritten_outputs.len(),
++            patched_outputs
++        )
++        .into());
++    }
++    model[graph_at].1 = pb::Value::Bytes(pb::encode(&rebuilt));
++    Ok(pb::encode(&model))
++}
++
++/// Confirm a filled tensor still fits what the skeleton expects.
++fn verify(name: &str, plan: &TensorPlan, dims: &[i64]) -> Result<()> {
++    if !plan.class_dependent && dims != plan.shape.as_slice() {
++        return Err(format!(
++            "{name}: skeleton expects {:?} but the checkpoint has {dims:?}; \
++             this checkpoint does not belong to this architecture",
++            plan.shape
++        )
++        .into());
++    }
++    if plan.class_dependent && dims.len() != plan.shape.len() {
++        return Err(format!(
++            "{name}: rank changed from {} to {}; the class count only resizes dimensions",
++            plan.shape.len(),
++            dims.len()
++        )
++        .into());
++    }
++    Ok(())
++}
++
++/// Produce the dimensions and bytes for one initializer, straight from the checkpoint.
++fn materialise(
++    plan: &TensorPlan,
++    weights: &HashMap<String, Source2>,
++    num_classes: usize,
++) -> Result<(Vec<i64>, Vec<u8>)> {
++    if plan.dtype != FLOAT_DATA_TYPE.to_string() {
++        return Err(format!(
++            "skeleton tensor {} has data type {}; only float32 is supported",
++            plan.name, plan.dtype
++        )
++        .into());
++    }
++
++    match &plan.source {
++        Source::Constant => Err(format!("{} is a constant and cannot be filled", plan.name).into()),
++        Source::Copy { key } => {
++            let source = weights
++                .get(key)
++                .ok_or_else(|| format!("checkpoint has no tensor {key} (needed by {})", plan.name))?;
++            if plan.class_dependent && source.shape.first() != Some(&(num_classes as i64)) {
++                return Err(format!(
++                    "{key}: the checkpoint's first dimension is {:?}, expected {num_classes} classes",
++                    source.shape.first()
++                )
++                .into());
++            }
++            ensure_len(&plan.name, &source.shape, &source.bytes)?;
++            Ok((source.shape.clone(), source.bytes.clone()))
++        }
++        Source::ConvBn { conv, bn, slot, eps } => {
++            let kernel = lookup(weights, &format!("{conv}.weight"))?;
++            let gamma = lookup(weights, &format!("{bn}.weight"))?;
++            let beta = lookup(weights, &format!("{bn}.bias"))?;
++            let mean = lookup(weights, &format!("{bn}.running_mean"))?;
++            let variance = lookup(weights, &format!("{bn}.running_var"))?;
++
++            let kernel_values = as_f32(&kernel.bytes, &format!("{conv}.weight"))?;
++            let gamma = as_f32(&gamma.bytes, &format!("{bn}.weight"))?;
++            let beta = as_f32(&beta.bytes, &format!("{bn}.bias"))?;
++            let mean = as_f32(&mean.bytes, &format!("{bn}.running_mean"))?;
++            let variance = as_f32(&variance.bytes, &format!("{bn}.running_var"))?;
++            let channels = gamma.len();
++            if beta.len() != channels || mean.len() != channels || variance.len() != channels {
++                return Err(format!("{bn} has inconsistent channel counts").into());
++            }
++            if channels == 0 || kernel_values.len() % channels != 0 {
++                return Err(format!(
++                    "{conv}.weight has {} values, not divisible by {channels} channels",
++                    kernel_values.len()
++                )
++                .into());
++            }
++            let per_channel = kernel_values.len() / channels;
++            let scale: Vec<f32> = (0..channels)
++                .map(|index| gamma[index] / (variance[index] + eps).sqrt())
++                .collect();
++
++            if slot == "weight" {
++                let mut fused = kernel_values;
++                for channel in 0..channels {
++                    let factor = scale[channel];
++                    for offset in 0..per_channel {
++                        fused[channel * per_channel + offset] *= factor;
++                    }
++                }
++                let dims = kernel.shape.clone();
++                let bytes = to_bytes(&fused);
++                ensure_len(&plan.name, &dims, &bytes)?;
++                Ok((dims, bytes))
++            } else {
++                let bias = weights
++                    .get(&format!("{conv}.bias"))
++                    .map(|source| as_f32(&source.bytes, conv))
++                    .transpose()?;
++                let mut fused = Vec::with_capacity(channels);
++                for channel in 0..channels {
++                    // Ultralytics convolutions carry no bias; a plain conv's bias is folded in too.
++                    let base = bias.as_ref().map(|values| values[channel]).unwrap_or(0.0);
++                    fused.push((base - mean[channel]) * scale[channel] + beta[channel]);
++                }
++                let dims = vec![channels as i64];
++                Ok((dims, to_bytes(&fused)))
++            }
++        }
++    }
++}
++
++fn lookup<'a>(weights: &'a HashMap<String, Source2>, key: &str) -> Result<&'a Source2> {
++    weights
++        .get(key)
++        .ok_or_else(|| format!("checkpoint has no tensor {key}").into())
++}
++
++fn ensure_len(name: &str, dims: &[i64], data: &[u8]) -> Result<()> {
++    let expected: i64 = dims.iter().product();
++    if expected * 4 != data.len() as i64 {
++        return Err(format!(
++            "{name}: dims {dims:?} need {} bytes, the checkpoint provides {}",
++            expected * 4,
++            data.len()
++        )
++        .into());
++    }
++    Ok(())
++}
++
++fn as_f32(bytes: &[u8], name: &str) -> Result<Vec<f32>> {
++    if bytes.len() % 4 != 0 {
++        return Err(format!("{name} is not a float32 tensor").into());
++    }
++    Ok(bytes
++        .chunks_exact(4)
++        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
++        .collect())
++}
++
++fn to_bytes(values: &[f32]) -> Vec<u8> {
++    let mut bytes = Vec::with_capacity(values.len() * 4);
++    for value in values {
++        bytes.extend_from_slice(&value.to_le_bytes());
++    }
++    bytes
++}
++
++fn rewrite_tensor(raw: &[u8], dims: &[i64], data: &[u8]) -> Result<Vec<u8>> {
++    let fields = pb::parse(raw)?;
++    let mut kept = Vec::with_capacity(fields.len());
++    for (field, value) in fields {
++        if field == TENSOR_DIMS
++            || field == TENSOR_RAW_DATA
++            || field == TENSOR_DATA_LOCATION
++            || TENSOR_TYPED_PAYLOADS.contains(&field)
++        {
++            continue;
++        }
++        kept.push((field, value));
++    }
++    // Dimensions first, then the payload: protobuf ignores order, but this keeps a hex dump
++    // readable and makes the tensor's shape visible before megabytes of weights.
++    let mut ordered = Vec::with_capacity(kept.len() + dims.len() + 1);
++    for dim in dims {
++        ordered.push((TENSOR_DIMS, pb::Value::Varint(*dim as u64)));
++    }
++    for (field, value) in kept {
++        if field == TENSOR_DATA_TYPE {
++            ordered.push((field, pb::Value::Varint(FLOAT_DATA_TYPE)));
++        } else {
++            ordered.push((field, value));
++        }
++    }
++    ordered.push((TENSOR_RAW_DATA, pb::Value::Bytes(data.to_vec())));
++    Ok(pb::encode(&ordered))
++}
++
++fn rewrite_output(
++    raw: &[u8],
++    plan: &OutputPlan,
++    manifest: &Manifest,
++    num_classes: usize,
++) -> Result<Vec<u8>> {
++    let mut rebuilt = Vec::new();
++    for (field, value) in pb::parse(raw)? {
++        if field != VALUE_INFO_TYPE {
++            rebuilt.push((field, value));
++            continue;
++        }
++        let type_bytes = value.as_bytes().ok_or("output type is not length-delimited")?;
++        rebuilt.push((
++            field,
++            pb::Value::Bytes(rewrite_output_type(type_bytes, plan, manifest, num_classes)?),
++        ));
++    }
++    Ok(pb::encode(&rebuilt))
++}
++
++fn rewrite_output_type(
++    raw: &[u8],
++    plan: &OutputPlan,
++    manifest: &Manifest,
++    num_classes: usize,
++) -> Result<Vec<u8>> {
++    let mut rebuilt = Vec::new();
++    for (field, value) in pb::parse(raw)? {
++        if field != TYPE_TENSOR {
++            rebuilt.push((field, value));
++            continue;
++        }
++        let tensor_bytes = value.as_bytes().ok_or("tensor type is not length-delimited")?;
++        let mut tensor_fields = Vec::new();
++        for (inner, inner_value) in pb::parse(tensor_bytes)? {
++            if inner != TENSOR_TYPE_SHAPE {
++                tensor_fields.push((inner, inner_value));
++                continue;
++            }
++            let shape_bytes = inner_value.as_bytes().ok_or("shape is not length-delimited")?;
++            tensor_fields.push((
++                inner,
++                pb::Value::Bytes(rewrite_shape(shape_bytes, plan, manifest, num_classes)?),
++            ));
++        }
++        rebuilt.push((field, pb::Value::Bytes(pb::encode(&tensor_fields))));
++    }
++    Ok(pb::encode(&rebuilt))
++}
++
++fn rewrite_shape(
++    raw: &[u8],
++    plan: &OutputPlan,
++    manifest: &Manifest,
++    num_classes: usize,
++) -> Result<Vec<u8>> {
++    let mut index = 0usize;
++    let mut rebuilt = Vec::new();
++    for (field, value) in pb::parse(raw)? {
++        if field != SHAPE_DIM {
++            rebuilt.push((field, value));
++            continue;
++        }
++        let dim_bytes = value.as_bytes().ok_or("dimension is not length-delimited")?;
++        let patch = plan.class_dims.iter().find(|dim| dim.dim == index);
++        index += 1;
++        let Some(patch) = patch else {
++            rebuilt.push((field, pb::Value::Bytes(dim_bytes.to_vec())));
++            continue;
++        };
++        // The class count moves this dimension by exactly the class delta; `base` is the value
++        // baked into the skeleton, which was generated at `base_classes`.
++        let delta = num_classes as i64 - manifest.base_classes as i64;
++        let now = patch.base + delta;
++        let mut dim_fields = Vec::new();
++        for (inner, inner_value) in pb::parse(dim_bytes)? {
++            if inner == DIM_VALUE {
++                dim_fields.push((inner, pb::Value::Varint(now as u64)));
++            } else {
++                dim_fields.push((inner, inner_value));
++            }
++        }
++        rebuilt.push((field, pb::Value::Bytes(pb::encode(&dim_fields))));
++    }
++    Ok(pb::encode(&rebuilt))
++}
++
++fn rewrite_node(
++    raw: &[u8],
++    scalar: Option<&ScalarPlan>,
++    plans: &[&AttributePlan],
++    manifest: &Manifest,
++    num_classes: usize,
++    channels: Option<i64>,
++) -> Result<Vec<u8>> {
++    let delta = num_classes as i64 - manifest.base_classes as i64;
++    let mut rebuilt = Vec::new();
++    for (field, value) in pb::parse(raw)? {
++        if field != NODE_ATTRIBUTE {
++            rebuilt.push((field, value));
++            continue;
++        }
++        let attribute = value.as_bytes().ok_or("attribute is not length-delimited")?;
++        let attribute = pb::parse(attribute)?;
++        let name = pb::string_field(&attribute, ATTRIBUTE_NAME).unwrap_or_default();
++
++        if let Some(plan) = plans.iter().find(|plan| plan.name == name) {
++            rebuilt.push((
++                field,
++                pb::Value::Bytes(patch_int_attribute(&attribute, plan, delta, channels)?),
++            ));
++            continue;
++        }
++        // The `Constant` node's payload is a tensor, and its content can follow the class count
++        // too (a Slice end of `4 + nc`).
++        if name == "value" {
++            if let Some(plan) = scalar {
++                let mut attribute_rebuilt = Vec::new();
++                for (inner, inner_value) in attribute {
++                    if inner != ATTRIBUTE_TENSOR {
++                        attribute_rebuilt.push((inner, inner_value));
++                        continue;
++                    }
++                    let tensor = inner_value
++                        .as_bytes()
++                        .ok_or("constant tensor is not length-delimited")?;
++                    attribute_rebuilt.push((
++                        inner,
++                        pb::Value::Bytes(patch_int64_tensor(tensor, plan, delta)?),
++                    ));
++                }
++                rebuilt.push((field, pb::Value::Bytes(pb::encode(&attribute_rebuilt))));
++                continue;
++            }
++        }
++        rebuilt.push((field, pb::Value::Bytes(pb::encode(&attribute))));
++    }
++    Ok(pb::encode(&rebuilt))
++}
++
++fn patch_int_attribute(
++    attribute: &[(u32, pb::Value)],
++    plan: &AttributePlan,
++    delta: i64,
++    channels: Option<i64>,
++) -> Result<Vec<u8>> {
++    let moved = |index: usize, base: &i64| {
++        if !plan.class_dependent.get(index).copied().unwrap_or(false) {
++            return *base;
++        }
++        if plan.rule == "weight_out_channels" {
++            return channels.unwrap_or(*base);
++        }
++        base + delta
++    };
++    let values = plan
++        .values
++        .iter()
++        .enumerate()
++        .map(|(index, base)| moved(index, base))
++        .collect::<Vec<_>>();
++
++    let mut rebuilt = Vec::new();
++    for (field, value) in attribute {
++        // The payload is re-emitted below in the encoding its `type` field declares; leaving the
++        // old one behind makes ONNX Runtime reject the node with "type field and data field
++        // mismatch in attribute group".
++        if *field == ATTRIBUTE_INT || *field == ATTRIBUTE_INTS || *field == ATTRIBUTE_TYPE {
++            continue;
++        }
++        rebuilt.push((*field, value.clone()));
++    }
++    if values.len() == 1 {
++        rebuilt.push((ATTRIBUTE_INT, pb::Value::Varint(values[0] as u64)));
++        rebuilt.push((ATTRIBUTE_TYPE, pb::Value::Varint(ATTRIBUTE_TYPE_INT as u64)));
++    } else {
++        for value in &values {
++            rebuilt.push((ATTRIBUTE_INTS, pb::Value::Varint(*value as u64)));
++        }
++        rebuilt.push((ATTRIBUTE_TYPE, pb::Value::Varint(ATTRIBUTE_TYPE_INTS as u64)));
++    }
++    Ok(pb::encode(&rebuilt))
++}
++
++fn patch_int64_tensor(raw: &[u8], plan: &ScalarPlan, delta: i64) -> Result<Vec<u8>> {
++    let mut rebuilt = Vec::new();
++    for (field, value) in pb::parse(raw)? {
++        // The vector is re-emitted below, so whatever encoding it had before must go.
++        if field == TENSOR_INT64_DATA || field == TENSOR_RAW_DATA {
++            continue;
++        }
++        rebuilt.push((field, value));
++    }
++    for (index, base) in plan.values.iter().enumerate() {
++        let moved = plan.class_dependent.get(index).copied().unwrap_or(false);
++        let value = base + if moved { delta } else { 0 };
++        rebuilt.push((TENSOR_INT64_DATA, pb::Value::Varint(value as u64)));
++    }
++    Ok(pb::encode(&rebuilt))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn source(shape: &[i64], values: &[f32]) -> Source2 {
++        Source2 {
++            shape: shape.to_vec(),
++            bytes: to_bytes(values),
++        }
++    }
++
++    #[test]
++    fn fold_matches_manual_batch_norm_math() {
++        // One channel, 1x1 kernel: w=2, bn(gamma=3, beta=1, mean=1, var=4), eps=0.
++        let mut weights = HashMap::new();
++        weights.insert("m.conv.weight".to_string(), source(&[1, 1, 1, 1], &[2.0]));
++        weights.insert("m.bn.weight".to_string(), source(&[1], &[3.0]));
++        weights.insert("m.bn.bias".to_string(), source(&[1], &[1.0]));
++        weights.insert("m.bn.running_mean".to_string(), source(&[1], &[1.0]));
++        weights.insert("m.bn.running_var".to_string(), source(&[1], &[4.0]));
++
++        let weight_plan = TensorPlan {
++            name: "m.conv.fused_weight".into(),
++            dtype: "1".into(),
++            shape: vec![1, 1, 1, 1],
++            class_dependent: false,
++            source: Source::ConvBn {
++                conv: "m.conv".into(),
++                bn: "m.bn".into(),
++                slot: "weight".into(),
++                eps: 0.0,
++            },
++        };
++        let (dims, data) = materialise(&weight_plan, &weights, 1).unwrap();
++        assert_eq!(dims, vec![1, 1, 1, 1]);
++        // scale = 3 / sqrt(4) = 1.5, so the fused weight is 3.0.
++        assert_eq!(as_f32(&data, "fused").unwrap(), vec![3.0]);
++
++        let bias_plan = TensorPlan {
++            name: "m.conv.fused_bias".into(),
++            dtype: "1".into(),
++            shape: vec![1],
++            class_dependent: false,
++            source: Source::ConvBn {
++                conv: "m.conv".into(),
++                bn: "m.bn".into(),
++                slot: "bias".into(),
++                eps: 0.0,
++            },
++        };
++        let (dims, data) = materialise(&bias_plan, &weights, 1).unwrap();
++        assert_eq!(dims, vec![1]);
++        // (0 - 1) * 1.5 + 1 = -0.5
++        assert_eq!(as_f32(&data, "fused").unwrap(), vec![-0.5]);
++    }
++
++    #[test]
++    fn rejects_checkpoints_that_do_not_fit_the_skeleton() {
++        let mut weights = HashMap::new();
++        weights.insert("m.weight".to_string(), source(&[2], &[1.0, 2.0]));
++        let plan = TensorPlan {
++            name: "m.weight".into(),
++            dtype: "1".into(),
++            shape: vec![3],
++            class_dependent: false,
++            source: Source::Copy {
++                key: "m.weight".into(),
++            },
++        };
++        // The skeleton expects three floats and the checkpoint has two: a different architecture,
++        // which must fail loudly instead of shipping a model with the wrong head width.
++        let (dims, _) = materialise(&plan, &weights, 1).unwrap();
++        assert!(verify("m.weight", &plan, &dims).is_err());
++    }
++
++    #[test]
++    fn output_shape_follows_the_class_delta() {
++        // A detection model's class output is [1, 8400, 4 + nc]; at base 80 that is 84.
++        let manifest = Manifest {
++            schema: "montgomery-onnx-skeleton-v1".into(),
++            model_id: "yolov8n".into(),
++            task: "detect".into(),
++            base_classes: 80,
++            onnx: "yolov8n.onnx".into(),
++            tensors: Vec::new(),
++            outputs: vec![OutputPlan {
++                name: "scores".into(),
++                class_dims: vec![ClassDim { dim: 2, base: 84 }],
++            }],
++        };
++        let plan = &manifest.outputs[0];
++        let info = shape_info(&[1, 8400, 84]);
++        let rebuilt = rewrite_shape(&info, plan, &manifest, 3).unwrap();
++        let dims = dims_of(&rebuilt);
++        assert_eq!(dims, vec![1, 8400, 7]);
++    }
++
++    /// Build a `TensorShapeProto` the way an exporter would.
++    fn shape_info(dims: &[i64]) -> Vec<u8> {
++        let mut same = Vec::new();
++        for dim in dims {
++            let value = pb::encode(&[(DIM_VALUE, pb::Value::Varint(*dim as u64))]);
++            same.push((SHAPE_DIM, pb::Value::Bytes(value)));
++        }
++        pb::encode(&same)
++    }
++
++    fn dims_of(shape: &[u8]) -> Vec<i64> {
++        let mut dims = Vec::new();
++        for (field, value) in pb::parse(shape).unwrap() {
++            if field != SHAPE_DIM {
++                continue;
++            }
++            for (inner, inner_value) in pb::parse(value.as_bytes().unwrap()).unwrap() {
++                if inner == DIM_VALUE {
++                    dims.push(inner_value.as_varint().unwrap() as i64);
++                }
++            }
++        }
++        dims
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 5faa809..e48027b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -33,10 +33,12 @@ use serde::Serialize;
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+ #[serde(rename_all = "lowercase")]
+ enum DeviceSelection {
+-    /// Burn Flex backend on the CPU (default).
++    /// Burn Flex backend on the CPU (default for inference).
+     Cpu,
+     /// Burn Wgpu backend on the GPU: Vulkan/DX12 on Windows and Linux, Metal on macOS.
+     Gpu,
++    /// Probe the GPU in an isolated process and fall back to the CPU when it cannot run a kernel.
++    Auto,
+ }
+ 
+ #[cfg(feature = "onnx")]
+@@ -82,6 +84,10 @@ enum Command {
+     #[cfg(feature = "training")]
+     #[command(name = "__batch-probe", hide = true)]
+     BatchProbe(BatchProbeArgs),
++    /// Internal isolated worker that proves a compute backend can execute a kernel end to end.
++    #[cfg(feature = "training")]
++    #[command(name = "__device-probe", hide = true)]
++    DeviceProbe(DeviceProbeArgs),
+ }
+ 
+ #[cfg(feature = "training")]
+@@ -189,6 +195,10 @@ struct TrainArgs {
+     /// Save a resumable `last` checkpoint every N epochs; improvements and the final epoch always save.
+     #[arg(long, default_value_t = 10)]
+     save_period: usize,
++    /// Compute device. `auto` probes the GPU in an isolated process and falls back to the CPU when
++    /// the driver cannot execute a kernel, which is what keeps a broken GPU from failing the run.
++    #[arg(long, value_enum, default_value = "auto")]
++    device: DeviceSelection,
+ }
+ 
+ #[cfg(feature = "training")]
+@@ -236,6 +246,26 @@ struct BatchProbeArgs {
+     request: PathBuf,
+ }
+ 
++/// Runs one tiny kernel on the requested backend and exits.
++///
++/// This lives in a child process on purpose. A GPU whose driver accepts a device and then fails the
++/// readback poisons it, and the panic takes the whole process down with it — there is nothing left
++/// to catch in-process. The parent only ever looks at the exit status.
++#[cfg(feature = "training")]
++#[derive(Debug, ClapArgs)]
++struct DeviceProbeArgs {
++    /// Backend to exercise: `gpu` (whatever the runtime settles on) or `cpu`.
++    #[arg(long, value_enum)]
++    device: DeviceProbeTarget,
++}
++
++#[cfg(feature = "training")]
++#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
++enum DeviceProbeTarget {
++    Gpu,
++    Cpu,
++}
++
+ #[cfg(feature = "onnx")]
+ #[derive(Debug, ClapArgs)]
+ struct ExportArgs {
+@@ -272,6 +302,10 @@ struct ExportArgs {
+     /// Official YOLOX 0.1.1rc0 checkout (YOLOX only).
+     #[arg(long)]
+     yolox_repo: Option<PathBuf>,
++    /// Directory of pre-generated skeletons. Fills one of them instead of building the graph,
++    /// which needs neither Python nor the Ultralytics source.
++    #[arg(long)]
++    template: Option<PathBuf>,
+     /// Training checkpoint state to export. Only EMA is currently available.
+     #[arg(long, value_enum, default_value = "ema")]
+     checkpoint_state: CheckpointState,
+@@ -602,6 +636,110 @@ fn select_automatic_batch_size(request: &TrainingRequest) -> montgomery::Result<
+     Ok(selected)
+ }
+ 
++/// How long a backend probe may take before it is treated as a failure.
++///
++/// A JIT backend compiles its first kernels on the fly, so a cold probe on integrated graphics can
++/// legitimately take a while. Past this point the driver is not going to answer.
++#[cfg(feature = "training")]
++const DEVICE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
++
++/// Decide which backend training will use, probing the GPU in a child process when asked to.
++///
++/// The probe cannot run in this process. A driver that accepts a device and then fails the readback
++/// poisons it, and the resulting panic unwinds the *whole* process — there is nothing left to catch.
++/// Only a separate process can be allowed to die and be replaced by a fallback.
++#[cfg(feature = "training")]
++fn resolve_training_backend(selection: DeviceSelection) -> montgomery::Result<&'static str> {
++    match selection {
++        DeviceSelection::Cpu => {
++            eprintln!("Device: cpu (requested)");
++            Ok("cpu")
++        }
++        DeviceSelection::Gpu => {
++            eprintln!("Device: gpu (requested)");
++            Ok("gpu")
++        }
++        DeviceSelection::Auto => {
++            if probe_backend(DeviceProbeTarget::Gpu) {
++                eprintln!("Device: gpu (probe passed)");
++                Ok("gpu")
++            } else {
++                eprintln!(
++                    "Device: cpu (GPU probe failed or timed out; falling back to the CPU — \
++                     training will be slower) [code GPU_FALLBACK]"
++                );
++                Ok("cpu")
++            }
++        }
++    }
++}
++
++/// Run the device probe as a child process and report whether it exited cleanly in time.
++#[cfg(feature = "training")]
++fn probe_backend(target: DeviceProbeTarget) -> bool {
++    let Ok(exe) = std::env::current_exe() else {
++        return false;
++    };
++    let label = match target {
++        DeviceProbeTarget::Gpu => "gpu",
++        DeviceProbeTarget::Cpu => "cpu",
++    };
++    let spawned = ProcessCommand::new(exe)
++        .arg("__device-probe")
++        .arg("--device")
++        .arg(label)
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null())
++        .spawn();
++    let Ok(mut child) = spawned else {
++        return false;
++    };
++
++    let deadline = Instant::now() + DEVICE_PROBE_TIMEOUT;
++    loop {
++        match child.try_wait() {
++            Ok(Some(status)) => return status.success(),
++            Ok(None) if Instant::now() >= deadline => {
++                let _ = child.kill();
++                let _ = child.wait();
++                return false;
++            }
++            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
++            Err(_) => return false,
++        }
++    }
++}
++
++/// Exercise one real kernel on the requested backend, reading the result back to the host.
++///
++/// The arithmetic is trivial and exact (32×32 of ones, multiplied, summed), so a failure here is a
++/// driver failure rather than a numerical one — and the readback is the step that catches the
++/// drivers that accept work but cannot return it.
++#[cfg(feature = "training")]
++fn run_device_probe(args: DeviceProbeArgs) -> montgomery::Result<()> {
++    use burn::tensor::{ElementConversion, Tensor};
++
++    let (device, adapter) = match args.device {
++        DeviceProbeTarget::Cpu => (Device::flex(), "cpu".to_owned()),
++        DeviceProbeTarget::Gpu => montgomery::default_wgpu_device(),
++    };
++
++    let ones = Tensor::<2>::zeros([32, 32], &device) + 1.0;
++    let product = ones.clone().matmul(ones);
++    let total: f32 = product.sum().into_scalar::<f32>().elem();
++
++    const EXPECTED: f32 = 32.0 * 32.0 * 32.0;
++    if !total.is_finite() || (total - EXPECTED).abs() > 1e-3 {
++        return Err(format!(
++            "device probe produced {total}, expected {EXPECTED} ({adapter})"
++        )
++        .into());
++    }
++    eprintln!("Device probe: {adapter} ok (sum {total})");
++    Ok(())
++}
++
+ #[cfg(feature = "training")]
+ fn run_batch_probe(args: BatchProbeArgs) -> montgomery::Result<()> {
+     let encoded = std::fs::read(&args.request)?;
+@@ -620,7 +758,80 @@ fn run_batch_probe(args: BatchProbeArgs) -> montgomery::Result<()> {
+     Ok(())
+ }
+ 
+-fn main() -> montgomery::Result<()> {
++fn main() -> std::process::ExitCode {
++    match run() {
++        Ok(()) => std::process::ExitCode::SUCCESS,
++        Err(error) => {
++            report_failure(&error.to_string());
++            std::process::ExitCode::FAILURE
++        }
++    }
++}
++
++/// Map an engine error onto a stable code plus advice the user can act on.
++///
++/// Codes exist so the GUI can branch (offer "switch to CPU", point at the bad file) instead of
++/// regex-matching English prose that changes whenever anyone edits a message.
++fn classify_failure(message: &str) -> (&'static str, Option<&'static str>) {
++    let lower = message.to_ascii_lowercase();
++    if lower.contains("device is poisoned") || lower.contains("device lost") {
++        (
++            "GPU_LOST",
++            Some(
++                "显卡驱动异常或显存不足。请更新显卡驱动，或改用 --device cpu 重新训练。",
++            ),
++        )
++    } else if lower.contains("no validation images") || lower.contains("validation split") {
++        (
++            "NO_DATASET",
++            Some("数据集缺少验证集。请添加 val 划分，或加 --no-val 跳过验证。"),
++        )
++    } else if lower.contains("dataset manifest") || lower.contains("dataset yaml") {
++        (
++            "NO_DATASET",
++            Some("数据集配置无法读取，请检查 dataset.yaml 路径与内容。"),
++        )
++    } else if lower.contains("label") || lower.contains("annotation") {
++        (
++            "BAD_ANNOTATION",
++            Some("标注文件格式有误。YOLO 格式每行应为：类别 中心x 中心y 宽 高（均为 0~1）。"),
++        )
++    } else if lower.contains("no batches") || lower.contains("no images") {
++        (
++            "EMPTY_DATASET",
++            Some("数据集里没有可用图片，请检查 train 划分指向的目录。"),
++        )
++    } else if lower.contains("out of memory") || lower.contains("oom") {
++        (
++            "OOM",
++            Some("显存或内存不足。请降低 --batch 或 --imgsz 后重试。"),
++        )
++    } else if lower.contains("class table differs") || lower.contains("class_names") {
++        (
++            "CLASS_MISMATCH",
++            Some("续训的类别表与当前数据集不一致。请换回原数据集，或重新开始训练。"),
++        )
++    } else {
++        ("INTERNAL", None)
++    }
++}
++
++/// Print the failure for humans on stderr and for the GUI on stdout.
++fn report_failure(message: &str) {
++    let (code, hint) = classify_failure(message);
++    eprintln!("error [{code}]: {message}");
++    if let Some(hint) = hint {
++        eprintln!("hint: {hint}");
++    }
++    #[cfg(feature = "training")]
++    montgomery::training::events::emit(&montgomery::training::events::TrainEvent::Error {
++        code: code.to_owned(),
++        message: message.to_owned(),
++        hint: hint.map(str::to_owned),
++    });
++}
++
++fn run() -> montgomery::Result<()> {
+     #[cfg(all(windows, feature = "training", debug_assertions))]
+     if std::env::var_os("RUST_MIN_STACK").is_none() {
+         // Burn/CubeCL creates deep named worker threads after CLI startup. Windows' default Rust
+@@ -651,6 +862,11 @@ fn main() -> montgomery::Result<()> {
+         Command::Export(args) => export_command(args),
+         #[cfg(feature = "training")]
+         Command::Train(args) => {
++            // Resolve the backend before anything touches Burn: the probe runs in a child process
++            // and its verdict has to be visible to `default_wgpu_device()` before it opens a device.
++            let backend = resolve_training_backend(args.device)?;
++            // Still single-threaded here, so the process-environment write is sound.
++            unsafe { std::env::set_var("MONTGOMERY_WGPU_BACKEND", backend) };
+             let initialization = match (args.architecture, args.model, args.resume) {
+                 (Some(architecture), None, None) => TrainingInitialization::Scratch(architecture),
+                 (None, Some(model), None) => TrainingInitialization::Pretrained(model),
+@@ -687,9 +903,10 @@ fn main() -> montgomery::Result<()> {
+             let run = train_native(request)?;
+             eprintln!("Training run: {}", run.display());
+             let best = run.join("exports/best.bpk");
++            let last = run.join("exports/last.bpk");
+             if best.exists() {
+                 eprintln!("Best model: {}", best.display());
+-                eprintln!("Last model: {}", run.join("exports/last.bpk").display());
++                eprintln!("Last model: {}", last.display());
+             } else if !args.dry_run {
+                 eprintln!(
+                     "Best checkpoint: {}",
+@@ -700,10 +917,17 @@ fn main() -> montgomery::Result<()> {
+                     run.join("checkpoints/last").display()
+                 );
+             }
++            // Terminal event: a GUI stops waiting here, so it has to carry the artifact paths.
++            montgomery::training::events::emit(&montgomery::training::events::TrainEvent::End {
++                run: run.display().to_string(),
++                best: best.exists().then(|| best.display().to_string()),
++                last: last.exists().then(|| last.display().to_string()),
++            });
+             Ok(())
+         }
+         #[cfg(feature = "training")]
+         Command::BatchProbe(args) => run_batch_probe(args),
++        Command::DeviceProbe(args) => run_device_probe(args),
+         #[cfg(feature = "training")]
+         Command::Val(args) => {
+             let summary = match (args.checkpoint, args.model, args.data) {
+@@ -790,6 +1014,7 @@ fn export_onnx_command(args: ExportArgs) -> montgomery::Result<()> {
+     options.verify = !args.no_verify;
+     options.python = args.python;
+     options.yolox_repo = args.yolox_repo;
++    options.template = args.template;
+     options.checkpoint_state = args.checkpoint_state;
+     options.simplify = args.simplify;
+     options.force = args.force;
+@@ -834,13 +1059,13 @@ fn predict(args: PredictArgs) -> montgomery::Result<()> {
+     match args.device {
+         DeviceSelection::Cpu => run_predict(&args, options, Device::flex()),
+         #[cfg(feature = "gpu")]
+-        DeviceSelection::Gpu => {
++        DeviceSelection::Gpu | DeviceSelection::Auto => {
+             let (device, adapter) = montgomery::default_wgpu_device();
+             eprintln!("GPU adapter: {adapter}");
+             run_predict(&args, options, device)
+         }
+         #[cfg(not(feature = "gpu"))]
+-        DeviceSelection::Gpu => Err(
++        DeviceSelection::Gpu | DeviceSelection::Auto => Err(
+             "GPU inference requires building Montgomery with the gpu feature: \
+              cargo build --release --features gpu"
+                 .into(),
+@@ -864,7 +1089,7 @@ fn bench(args: BenchArgs) -> montgomery::Result<()> {
+             )
+         }
+         #[cfg(feature = "gpu")]
+-        DeviceSelection::Gpu => {
++        DeviceSelection::Gpu | DeviceSelection::Auto => {
+             let (device, adapter) = montgomery::default_wgpu_device();
+             run_bench(
+                 &args,
+@@ -874,7 +1099,7 @@ fn bench(args: BenchArgs) -> montgomery::Result<()> {
+             )
+         }
+         #[cfg(not(feature = "gpu"))]
+-        DeviceSelection::Gpu => Err(
++        DeviceSelection::Gpu | DeviceSelection::Auto => Err(
+             "GPU inference requires building Montgomery with the gpu feature: \
+              cargo build --release --features gpu"
+                 .into(),

@@ -49,3 +49,20 @@ yolo26 的 `head.o2m_*` 是训练辅助头：`forward()` 只走 one2one 单头�
 
 实测：`Overriding model.yaml nc=1000 with nc=3`，3 类分类模型导出成功并通过 ONNX Runtime 校验。
 详见 `docs/DECISIONS.md` D026。
+
+## 0004 · 免 Python 的 ONNX 导出（`export --template`）
+
+给 `OnnxExportOptions` 加 `template: Option<PathBuf>` 与 CLI 的 `--template <目录>`。给了这个参数
+就走**离线路径**：不解析 Python、不找 ultralytics 源码、跑完不进 `validate_options`，直接把预生成
+骨架填成完整模型。
+
+- `src/export/pb.rs`：手写 protobuf 编解码。只重编码认识的字段，未知字段原样保留；写法保守
+  （尺寸/字符串按长度前缀、整数按 varint），够用来改 `TensorProto`、`ValueInfoProto` 和
+  `AttributeProto`。
+- `src/export/template.rs`：读 `<model>.json` → 复用 `snapshot::write_snapshot` 拿到按 keymap
+  改好名的权重 → 逐初始化器写 `raw_data` → 平移输出维度 → 改 `Constant` 值与整数属性。
+  Conv+BN 融合、DFL 常量、`group` 取值都在这里处理，细节见 `docs/DECISIONS.md` D027。
+
+**必须在 `--features training,onnx` 下编译。** 生成的骨架由 `tools/onnx_skeleton/generate_all.py`
+产出，和这个补丁是配套的：骨架清单的字段（`source`/`class_dependent`/`scalars`/`attributes`）
+就是这里读的契约。

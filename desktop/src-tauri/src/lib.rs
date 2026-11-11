@@ -30,6 +30,7 @@ use tauri::{Emitter, Manager, State};
 mod control;
 mod dataset;
 mod engine;
+mod onnx_export;
 mod predict;
 mod runstate;
 mod runtime;
@@ -102,6 +103,35 @@ fn predict_image(
     predict::run(&engine, &request, &model, &default_dir)
 }
 
+/// Export the current model as ONNX. Blocking for the same reason as `predict_image`: the engine
+/// takes a few seconds and Tauri already runs synchronous commands off the main thread.
+#[tauri::command]
+fn export_onnx(
+    runtime: State<'_, Runtime>,
+    request: onnx_export::ExportRequest,
+) -> Result<onnx_export::ExportResult, String> {
+    let engine = engine::resolve(runtime.settings().engine_path.as_deref())?;
+    let model = match request
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(path) => std::path::PathBuf::from(path),
+        None => runtime
+            .run_snapshot()
+            .get("best")
+            .and_then(serde_json::Value::as_str)
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| "还没有可导出的模型：先跑一次训练。".to_owned())?,
+    };
+    if !model.is_file() {
+        return Err(format!("模型文件不存在：{}", model.display()));
+    }
+    let templates = onnx_export::resolve_templates()?;
+    onnx_export::run(&engine, &model, &templates, &runtime.output_root().join("onnx"))
+}
+
 #[tauri::command]
 fn start_training(runtime: State<'_, Runtime>, request: TrainRequest) -> Result<(), String> {
     runtime.start_training(&request)
@@ -155,6 +185,7 @@ pub fn run() {
             start_training,
             stop_training,
             predict_image,
+            export_onnx,
             get_settings,
             save_settings,
             app_version,
