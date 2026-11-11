@@ -16,12 +16,30 @@
 | 训练 1 epoch（CPU） | `train --epochs 1 --no-val` | ✅ `loss 4573.58`，产出 checkpoints + exports |
 | 训练产物推理 | `predict --model exports/best.bpk` | ✅ 正常输出检测结果、写出标注图 |
 
-## 本轮新增：GitHub 仓库与自动更新（2026-11-11）
+## 全面审查（2026-11-11 白天）
 
+四路只读审查（前端 / Rust 后端 / 发版工程化 / 文档契约）后修的缺陷，全部有明确触发条件：
+
+| 项目 | 结论 |
+| --- | --- |
+| `App.tsx` 事件订阅 | **真 bug**：清理跑在 `listen()` promise resolve 之前，StrictMode 每次挂载必现泄漏，第二次挂载起每个 epoch 被折叠两次（loss 曲线翻倍）。已修 |
+| `TrainPage` 整数校验 | **真 bug**：`u32` 字段接受 "1.5"，通过范围检查后在 serde 炸出英文类型错误。已修（`Number.isInteger`） |
+| `PredictCard` 连点 | 对话框未返回时可开第二个对话框并排两次推理。已修（ref 全程占位） |
+| `App.tsx` 拖放 | 两次拖放无序号，慢的 A 会覆盖快的 B。已修 |
+| `UpdateCard` | 失败分支用闭包旧 `version`，首次失败显示 `—`。已修 |
+| 控制服务 | 实际端口、Content-Length/header 上限、常量时间鉴权、`Expect: 100-continue`、409 并发、文档版本号来源。已修 |
+| 回归 | `cargo test --lib` 37/37 通过；`tsc --noEmit` 干净；`vite build` 9.01s |
+
+**引擎体积实测**（回答"137 MiB 引擎怎么进 29 MiB 安装包"）：`montgomery.exe` 137.38 MiB，
+`.text` 占 76%；LZMA9e 单压 **20.91 MiB（6.57x）**。安装包 29.1 MiB ≈ 20.9（引擎）+ 4.5（壳）
++ 前端资源 + NSIS stub。**只有安装包和下载被压缩，落盘仍是 137 MiB。**
+可选优化（未做）：`lto="fat"` + `codegen-units=1` + `strip`，需 fork 上游且本机编译时间翻倍。
+
+## 本轮新增：GitHub 仓库与自动更新（2026-11-11）
 | 项目 | 实测结果 |
 | --- | --- |
 | 仓库 | `QiuMr/yolo-trainer-lab`（**public**，D021）；首次提交 472 文件 / 11.63 MiB，22 GB 构建产物与上游源码全部排除 |
-| `cargo test --lib` | ✅ 28 passed / 1 ignored（新增 `version` 3 + `updater` 3） |
+| `cargo test --lib` | ✅ **37 passed / 1 ignored**（全面审查后从 28 增至 37） |
 | `npx tsc --noEmit` | ✅ 干净 |
 | 带签名 `npx tauri build` | ✅ 5m35s；`setup.exe` 29.07 MiB + `.exe.sig` 444 B |
 | `scripts/release.ps1` | ✅ UTF-8 BOM + CRLF，PowerShell 解析 0 错误 |

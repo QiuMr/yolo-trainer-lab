@@ -1,5 +1,56 @@
 # 变更记录
 
+## 2026-11-11 白天 · 全面审查与缺陷修复
+
+四个只读审查代理并行过了一遍：前端状态与手势、Rust 后端边界、发版工程化、文档与测试契约。
+原则是**只修能证明会出错的地方**，不为了"更整洁"重构。下面每条都指明触发条件，方便日后判断
+是否还成立。
+
+### 前端（5 处，均有可复现触发条件）
+
+| 位置 | 缺陷 | 后果 |
+| --- | --- | --- |
+| `App.tsx` 事件订阅 | 清理函数在 `listen()` 的 promise resolve 之前就可能执行 | **StrictMode 每次挂载都必现**：`disposers` 还是空数组，清理什么都没做，句柄随后被推进已经走过去的数组 → 监听器永久泄漏；第二次挂载又注册一个 → **每个 epoch 被折叠两次**，loss 曲线和日志全部翻倍。改成 `alive` 标志 + 迟到的句柄当场注销 |
+| `App.tsx` 拖放扫描 | 两次拖放没有序号 | 大目录扫描慢，先拖 A 后拖 B，A 后返回会覆盖 B 的结果 |
+| `PredictCard.tsx` | `busy` 只覆盖推理，不覆盖文件对话框 | 对话框还没返回时再点一次会开第二个对话框并排队第二次推理，后返回的答案覆盖前一个。改用 ref 在整个手势期间占位 |
+| `TrainPage.tsx` | 只校验数值范围，没校验整数 | 壳侧 `epochs/batch/imgsz` 是 `u32`，"1.5" 能通过范围检查，然后在 serde 报 `invalid type: floating point 1.5, expected u32` —— 用户看到一串读不懂的英文。加 `Number.isInteger` |
+| `UpdateCard.tsx` | 失败分支读的是渲染时闭包里的 `version` | 首次检查若 `getAppVersion` 成功而 `checkUpdate` 失败，标题显示 `—` 而不是刚读到的版本号 |
+
+`PredictCard`、`SettingsPage` 原本就写对了 `alive` 守卫，`App.tsx` 是唯一漏的一处 —— 同一模式
+在不同文件里不一致，正是这类 bug 的常见来源。
+
+### 后端
+
+- `control.rs`：`Handle` 记录**实际**端口（回退到系统分配时不再谎报 `control_port`）；accept 循环
+  与 `handle()` 重整，未鉴权请求不再有崩溃路径；`read_request` 加 Content-Length 与 header 总量
+  上限、处理 `Expect: 100-continue`；鉴权改常量时间比较并同时接受 `Bearer`/`bearer` 与 `?token=`；
+  `percent_decode` 修正 `%XX` 越界判断；`POST /train` 校验路径存在性与数值范围，并发冲突返回
+  **409** 而不是 500；自描述文档的版本号改用 `version::VERSION`（原来取的是 `CARGO_PKG_VERSION`，
+  两者在打包态会不一致）。
+- `engine.rs`：spawn 前判断"运行中/启动中"，避免并发两次启动留下孤儿进程。
+- `predict.rs`：`--output` 强制落在应用目录内（引擎自己算的路径不可控），`device` 走白名单。
+- `runtime.rs`：视图回传控制服务的实际端口。`settings.rs`：`output_dir` 归一化。
+- `version.rs`：补短版本、带后缀、垃圾输入的测试。
+
+### 引擎体积的实际构成（回答"137 MiB 怎么装进 29 MiB 包"）
+
+实测 `montgomery.exe` = 137.38 MiB，段构成：`.text` 104.47 MiB（76%）、`.rdata` 27.32 MiB（20%）、
+`.pdata` 4.57 MiB（3.3%）。单独用 LZMA9e 压整个文件 → **20.91 MiB（6.57x）**，分段看 `.text` 6.41x、
+`.rdata` 7.20x、`.pdata` 3.04x。安装包 29.1 MiB ≈ 引擎压缩后 20.9 + `desktop.exe` 约 4.5 + 前端
+资源 + NSIS stub。安装后引擎原样落盘 144,057,344 字节 —— **压缩只在传输和安装包上，磁盘占用不变**。
+
+代码段能压 6.4x（正常 x86 是 2~3x）说明二进制里有大量**结构重复的机器码**：cubecl 的 kernel 对
+每种 dtype 单态化一份，`codegen-units` 默认又不做跨单元合并。这是真实的可优化空间（`lto="fat"` +
+`codegen-units=1` + `strip`），但没有做：montgomery 是上游代码，改它要 fork，且会让本机编译时间
+从约 8 分钟涨到 20 分钟以上，而用户已明确接受当前体积。**记录为已知选项，不是遗漏。**
+
+### 回归
+
+- `cargo test --lib` → **37 passed / 0 failed / 1 ignored**（原 28，本轮新增 9）。
+- `npx tsc --noEmit` → 干净。`npx vite build` → 9.01s，主 chunk 1.44 MB（gzip 472 kB，主要是 ECharts）。
+
+---
+
 ## 2026-11-11 凌晨 · 发版链路实测收尾（`quiet` 安装模式）
 
 首个 Release 发出去之后做了三轮真实演练，把"看起来能更新"推进到"知道哪一步会失败、为什么"。
