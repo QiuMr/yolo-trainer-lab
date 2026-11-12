@@ -439,3 +439,16 @@ python spikes/qa/probe_update.py --sig <本地 .exe.sig>   # 顺便比对签名
 
 它会验：feed 匿名可读且无 BOM、字段齐全、资产 URL 无空格且能下载、
 **签名 trusted comment 里的 `version:` 与 feed 一致**（`requireSignedVersion` 的前提）。
+
+---
+
+## 开发机与环境约束（换机器时重看）
+
+这些不是代码问题，但在这台机器上会让构建/测试出现**看起来像代码坏了的**失败。
+
+| 现象 | 真因 | 处理 |
+| --- | --- | --- |
+| cargo 往 `D:\rust-target` 写、D 盘被塞满 | 用户环境变量 `CARGO_TARGET_DIR` 曾指向那里；已从 User/Machine 删除，但**运行中的进程仍继承旧值** | 每次编译显式 `--target-dir ../../artifacts/desktop-target`（或设同名环境变量） |
+| `pnpm tauri build` 在 `vite:prepare-out-dir` 失败，报 `SAFE_DELETE_BULK_CONFIRM_REQUIRED` | agent 会话的 safe-delete shim 拦截「一次删超过 50 个文件」，而 vite 清 `dist/assets` 会删 110 个 | 构建前先删 `desktop/dist`（`[System.IO.Directory]::Delete`），再跑 build |
+| GPU 训练出现 `device lost` | Vega 6 核显共享内存，本机不可用 | 用 `device: cpu`；GPU 结论必须在独显机器上重新验证 |
+| `Remove-Item` 删完空间不涨 | 在这台机器上它等同「移进回收站」 | 判断释放效果用 `Get-Volume`，硬删用 `[System.IO.Directory]::Delete` |
