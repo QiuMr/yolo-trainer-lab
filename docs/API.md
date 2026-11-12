@@ -298,11 +298,22 @@ Python**：安装包里带了每个架构的无权重骨架（`resources/onnx/<m
 | POST | `/stop` | 中止训练 | 200 |
 | POST | `/predict` | 用训练好的模型推理一张图 | 200 |
 | GET | `/datasets/scan?path=...` | 校验数据集目录 | 200 |
+| POST | `/datasets/scan` | 同上，路径放 JSON body（免 percent-encode） | 200 |
+| GET | `/runs` | 历史运行与可用产物（重启后找旧模型的唯一途径） | 200 |
 | GET | `/settings` | 读配置（`SettingsView`） | 200 |
 | PUT | `/settings` | 整体替换配置 | 200 |
 
 错误一律是 `{"ok":false,"error":"人话"}`，状态码 `400`（参数/路径）、`401`（令牌）、
-`404`（端点）、`405`（方法）、`409`（已有训练在跑）、`500`（引擎/磁盘）。
+`404`（端点）、`405`（方法）、`409`（已有训练在跑）、`500`（引擎/磁盘）、`503`（并发超限）。
+
+**`400` 与 `500` 的分界是"谁该改"**：`400` 表示参数或路径不对，改请求就能过；`500` 表示
+服务或引擎这边失败了，改请求没用。`/predict` 曾把引擎崩溃也报成 `400`，客户端于是一直在
+调参数——所以这条边界在 2026-11-13 之后是刻意维持的。
+
+**`503` 表示同时打开的连接达到 64 个**。每个连接占一个线程，且最长可存活 30 秒（读写超时），
+所以轮询不加间隔的客户端有可能把线程堆起来。收到 `503` 就退避重试，不要立刻重发——
+包括 `/health` 在内的所有路径都会在连接被接受前就被拒。这个上限是防服务被本机客户端拖垮，
+不是网络限流：服务只监听回环地址。
 
 ### 9.2 `GET /health`
 
@@ -321,6 +332,7 @@ Python**：安装包里带了每个架构的无权重骨架（`resources/onnx/<m
   "epoch": 7,
   "total_epochs": 20,
   "last_loss": 1.8342,
+  "last_fitness": 0.312,        // 验证适应度（检测看 mAP）；--no-val 时为 null
   "last_epoch_seconds": 1.21,
   "backend": "cpu",             // 实际后端，不是请求的 device
   "adapter": "Device<Flex(Cpu)>",
@@ -333,11 +345,28 @@ Python**：安装包里带了每个架构的无权重骨架（`resources/onnx/<m
 }
 ```
 
-带 `?since=N` 时返回：
+**`last_fitness` 是判断模型好坏的那个数**。只看 `last_loss` 区分不了"在学"和"在背"——
+本项目的 tiny 数据集上 loss 一路下降而 mAP 始终为 0 的情况真实出现过。`--no-val` 时为 `null`
+（不是 `0`，那会把没测过的模型说成零分）。
 
-```json
-{"ok":true,"state":{…},"cursor":12,"events":[{"type":"epoch","epoch":7,…}]}
+带 `?since=N` 时返回（`/events` 是同一个形状，只是没有 `state`）：
+
+```jsonc
+{"ok":true,"state":{…},"cursor":12,"reset":false,"truncated":false,
+ "events":[{"type":"epoch","epoch":7,…}]}
 ```
+
+| 字段 | 含义 |
+| --- | --- |
+| `cursor` | 下次把它当 `since` 传回来。**每次都覆盖本地值**，不要在 events 为空时保留旧值 |
+| `reset` | 你带的 cursor 比本进程的计数器大——只可能是应用重启过（`seq` 每次启动从 0 计）。事件已从缓冲区开头**重放**给你，按"重新开始"处理即可 |
+| `truncated` | 你漏了事件：缓冲区只留最近 400 条（引擎日志也算事件）。收到就先读一遍 `/state` 的快照 |
+
+`reset` / `truncated` **总是出现**（不是只在为 true 时出现），客户端不必判断字段存在性。
+
+**为什么需要 `reset`**：`seq` 是进程级的。一个把 cursor 存盘、只在 events 非空时才推进的
+客户端，在应用重启后会永远停在"没有新事件"——它问 `since=500`，而新进程才到 `seq=3`。
+这条规则曾经只写在代码注释里，实测踩到后才变成协议的一部分。
 
 **不要用 SSE**：轮询 `since` 是幂等的、可断线重连的，而且不需要客户端维持长连接
 （DECISIONS D019）。一次轮询的成本是一次内存拷贝。
@@ -379,15 +408,47 @@ Python**：安装包里带了每个架构的无权重骨架（`resources/onnx/<m
 {"ok":true,
  "accepted":{"init":{"mode":"scratch","architecture":"yolo26n"},"dataset":"E:/data/coco-mini",
              "epochs":20,"batch":4,"imgsz":null,"device":"auto"},
+ "warnings":[],
  "note":"已开始。轮询 GET /state 或 GET /events?since=<cursor> 获取进度。"}
 ```
 
+**`accepted` 里是引擎真正会用的值，不是请求里的值。** 唯一会被改写的是 `device`：
+只接受 `auto` / `cpu` / `gpu`，其他一律变成 `auto` 并出现在 `warnings` 里（例如
+`"device 只接受 auto / cpu / gpu，已改成 auto。"`）。2026-11-13 之前这里回显的是请求原文，
+叫 `gpu` 却静默回退成 `auto` 的调用方无从察觉。
+
+`warnings` 也可能带数据集的问题（如"没有验证集，训练时会跳过 mAP 计算"）。数组为空表示
+一切如请求所愿。
+
+**开训前会预检数据集与架构任务是否匹配**。`--architecture` 的后缀决定任务：无后缀是检测，
+`-seg` 是实例分割，`-cls` 是分类；`-sem` / `-depth` 直接拒绝（引擎只能推理，没有对应损失）。
+分类模型配 YOLO 数据集、或检测模型配类别文件夹数据集，返回 `400` 并说明该改架构还是该换数据集。
+这条检查与界面的 `taskProblem()` 同规则——界面上能拦住的，HTTP 上也要能拦住，否则 AI 会
+先跑一分钟加载权重，再拿到一句引擎措辞的报错。
+
+**`202` 返回的那一刻，`/state` 已经是 `running`。** 从接受请求到引擎发出第一个 `start`
+事件之间有一段初始化时间（本机实测几十秒），这段时间里报 `idle` 会让调用方以为请求被忽略，
+于是重发一次 `/train`，拿到 `409`。所以接受请求时就推进到 `running` 并填好 `total_epochs`；
+此阶段 `seq` 不变，因为确实还没有事件发生。反过来，**引擎没能启动**时状态是 `failed`，
+`error.code` 为 `spawn_failed`，不会是 `running`——否则调用方会一直轮询一个不存在的进度。
+
+扫描器不认的格式（例如 COCO）**不会**被这条预检拦住：引擎能读 COCO，扫描器还不能，
+放行后由引擎给出它自己的错误。
+
 已被占用时返回 `409`，不会排队——排队会让"我点了开始"和"它什么时候开始"脱节。
 
-### 9.5 `GET /datasets/scan?path=…`
+### 9.5 `GET /datasets/scan?path=…` / `POST /datasets/scan`
 
-返回与 `scan_dataset` 相同的 `DatasetSummary`（`dataset` 字段里）。路径必须
+两个入口返回完全相同的 `DatasetSummary`（`dataset` 字段里）。GET 的路径必须
 percent-encode；服务端按 UTF-8 解码，中文目录名可用。
+
+POST 版本接受 JSON body，**中文或带空格的路径用它更省事**，不必手工编码：
+
+```json
+{"path":"E:/工作区/数据/coco-mini"}
+```
+
+`path` 既可以是含 `dataset.yaml` 的目录，也可以是 yaml 本身。空字符串 → `400`。
 
 字段里有两个是**前端必须用对的**：
 
@@ -425,6 +486,18 @@ percent-encode；服务端按 UTF-8 解码，中文目录名可用。
 （`xxx-detections.png`），那会污染数据集目录——本项目已经因此踩过一次坑，所以端点强制指定
 `--output`。`model` 不存在或 `source` 不是文件时返回 `400`，不会去猜。
 
+失败的状态码按责任方分：
+
+| 情形 | 状态码 |
+| --- | --- |
+| `source` 为空 / 图片不存在 | `400` |
+| `confidence` 不在 0–1 | `400` |
+| 模型文件不存在 | `400` |
+| 引擎启动失败 / 引擎非零退出 / 输出里没有 JSON | `500` |
+
+引擎非零退出算 `500` 而不是 `400`：图片和模型在上面都已确认存在，剩下的失败是引擎拒绝了
+这份输入，客户端换参数重试没有意义。
+
 ### 9.7 `PUT /settings`
 
 请求体是完整的 `settings::Settings`（不是补丁）：
@@ -447,6 +520,58 @@ montgomery stdout ──▶ hub ──▶ 订阅线程 ──┬─▶ RunState�
 ```
 
 所以界面显示到第 7 轮时，`/state` 也一定是第 7 轮。不存在两份进度。
+
+### 9.9 `GET /runs?limit=N`
+
+**为什么需要它**：`/state` 只记得**本进程**跑过的训练。应用重启后它是 `idle`、`best` 是
+`null`，而磁盘上的 `exports/best.bpk` 全都在。没有这个端点时，"用你昨天训的模型给这张图
+打分"这件事在重启之后无法完成——AI 只能让用户去翻文件夹。
+
+```
+GET /runs?limit=10      // limit 默认 50，上限 200
+```
+
+```jsonc
+{"ok":true,
+ "root":"C:\\Users\\…\\com.yolotrainer.desktop\\runs",
+ "count":2,
+ "note":"用 runs[].best 作为 POST /predict 的 model；续训用 runs[].dir + \\checkpoints\\last。",
+ "runs":[
+  {"name":"train-1794330519-00007198",
+   "task":"classify",
+   "dir":"…\\runs\\classify\\train-1794330519-00007198",
+   "modified_unix":1762794479,
+   "epochs_completed":4,
+   "final_loss":0.9243,
+   "final_fitness":0.3333,
+   "best":"…\\exports\\best.bpk",
+   "last":"…\\exports\\last.bpk",
+   "resumable":true,
+   "classes":["circle","square","triangle"]}
+ ]}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `name` / `dir` | 运行目录名与绝对路径 |
+| `task` | `detect` / `segment` / `classify`。取自运行自己的 `config.resolved.json`，取不到才看父目录名——移动目录不该改变它自称是什么 |
+| `modified_unix` | 目录 mtime（秒）。排序用它，所以列表**新的在前** |
+| `epochs_completed` | `results.csv` 里最大的 epoch 编号。`0` 表示这条 run 建了目录就死了 |
+| `final_loss` | 最后一轮 `train/loss` |
+| `final_fitness` | 最后一轮 `fitness`（验证指标）。`null` 表示 `--no-val` **或该格为空**——不会把"没测"读成 0 |
+| `best` / `last` | `exports/*.bpk` 存在时才有。`best` 可直接当 `/predict` 的 `model` |
+| `resumable` | `checkpoints/last` 三件套（`manifest.json`/`model.bin`/`optimizer.bin`）齐全，可直接做 `{"init":{"mode":"resume"}}` |
+| `classes` | 类别名表，来自 `config.resolved.json` 或 `dataset.json` |
+
+**`results.csv` 是按列名解析的，不按位置**。表头随任务变化：分类没有 `metrics/mAP50(B)`，
+分割多出 `train/mask_loss`。按位置读会在引擎加列的那天静默返回错的数字，而一个错的
+`final_fitness` 比没有更糟。
+
+目录不存在（全新安装还没有 `runs/`）返回 `{"ok":true,"count":0,"runs":[]}`，不是错误。
+
+**路径的分隔符不保证与 `/state` 一致**：这里的 `best` 由服务端用平台分隔符拼接（`…\exports\best.bpk`），
+而 `/state` 的 `best` 是引擎原样输出的（可能写成 `…/exports/best.bpk`）。两者指向同一个文件，
+**不要用字符串比较，用文件系统解析后的结果判断**（端到端测试就是这样做断言的）。
 
 ---
 

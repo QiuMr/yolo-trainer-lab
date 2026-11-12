@@ -85,15 +85,7 @@ struct ResumeInfo {
 
 impl TrainRequest {
     fn device(&self, fallback: &str) -> String {
-        let requested = self.device.trim();
-        if requested.is_empty() {
-            return fallback.to_owned();
-        }
-        if super::settings::DEVICES.contains(&requested) {
-            requested.to_owned()
-        } else {
-            "auto".to_owned()
-        }
+        super::settings::normalize_device(&self.device, fallback)
     }
 }
 

@@ -1,10 +1,66 @@
-# 项目状态（2026-11-11）
+# 项目状态（2026-11-13）
 
 ## 一句话结论
 
 **montgomery 的完整链路可用**：数据 → 训练 → 导出 `.bpk` → 推理，全部在本机跑通（CPU 后端）。
 桌面壳、AI 操控接口、45 个模型选择器、分类链路、单图推理都已闭环；本轮补上 GitHub 仓库、
 版本管理与自动更新。GPU 后端在这台机器上不可靠，需换独显机器验证。
+
+## AI 接口第三轮（2026-11-13，真实端到端实测）
+
+第二轮只验证了单个端点。这一轮补了一条**串起全流程**的测试，第一次跑就失败了——420 秒超时，
+`/state` 始终 `idle`、`seq` 始终 0，而引擎在旁边正常训练。修完后同一条测试 **3.5 秒跑完**。
+决策见 D031。
+
+| 项 | 状态 | 怎么验的 |
+| --- | --- | --- |
+| 全流程串联 | ✅ | `health → 两个 scan 入口 → 任务不匹配 400 → 空转 /stop → /train → 轮询到 done → /runs → /predict`，真实引擎 + 真实数据集 |
+| 无窗口进程也能看到进度 | ✅ **（修了架构缺陷）** | 此前折叠在 Tauri `setup` 里，没有窗口就没有订阅者；现移到 `Runtime::new`，测试不再需要模拟 `setup` |
+| `202` 后立即是 `running` | ✅ | 改前是 `idle`，调用方会重发 `/train` 拿 409；`total_epochs` 同时填好，`seq` 不动 |
+| 引擎启动失败可见 | ✅ | `error.code = spawn_failed`，同时出现在 `/events` |
+| 并发连接上限 | ✅ | 开满 64 个不说话的连接 → 第 65 个得可读的 `503`；释放后恢复 200（计数不泄漏） |
+| 两个端点路径写法不同 | ✅ **（已记录，未统一）** | `/runs` 用 `\`、`/state` 用引擎原样的 `/`，指向同一文件；测试按 `canonicalize` 比较 |
+| `cargo test --lib` | ✅ **62 passed / 0 failed / 4 ignored** | 含 1 条 `#[ignore]` 的真实训练测试（`-- --ignored` 触发） |
+| clippy | ✅ 新增代码零警告 | 余下 8 条均为既有代码建议 |
+
+**训练副产品**：这次 e2e 用 tiny-dataset（4 张训练图）跑 1 epoch，得到 `loss=4493`、
+`fitness=0.0`。又一次印证了「loss 有值但 mAP 为 0」——只能靠 `fitness` 判断模型好坏，
+不能看 loss。
+
+## AI 操控接口第二轮（2026-11-13，全部为测试实测）
+
+这一轮不加新功能，只修"AI 会拿到错答案"的地方。决策见 D030，契约见 `docs/API.md` 第 9 节。
+
+| 项 | 状态 | 怎么验的 |
+| --- | --- | --- |
+| 重启后能找到旧模型 | ✅ | 新端点 `GET /runs`；真实 15 个 run 全部解析正确（task/epochs/loss/fitness/best/resumable/classes） |
+| 空壳 run 不被当成可用 | ✅ | 4 个 `epochs=0` 且无 exports 的 run 报 `resumable=false`、`best=null` |
+| `results.csv` 按列名解析 | ✅ | 两个 fixture：检测表头与分类表头，列位置不同仍取到正确的 loss/fitness |
+| 空指标格读成 null | ✅ | `--no-val` 的空格断言为 `None`，不是 `0` |
+| `last_fitness` 进快照 | ✅ | `epoch` 事件带 `fitness: 0.0421` → `/state.last_fitness`；`null` → `None` |
+| cursor 重启不卡死 | ✅ | `?since=999999` → `reset:true`、cursor=0、事件从缓冲区开头重放 |
+| 漏事件可见 | ✅ | 灌 425 条事件 → `truncated:true`；正常轮询 → `false` |
+| `POST /datasets/scan` | ✅ | 与 GET 入口逐字段相等（同一份 `DatasetSummary`），中文路径免编码 |
+| 任务/数据集不匹配提前拦 | ✅ | `yolo26n-cls` + tiny-dataset（yolo 格式）→ `400`，文案点名"分类"与要改的架构 |
+| device 回显生效值 | ✅ | 传 `tpu` → `accepted.device=auto`，`warnings` 里有一句解释 |
+| `/predict` 错误分级 | ✅ | 图片缺失/confidence 越界 → 400；引擎非零退出/无 JSON → 500 |
+| `/stop` 不说谎 | ✅ | 无训练时 `stopped:false` + "没有需要停止的东西" |
+| 鉴权顺序 | ✅ | `GET /` 免令牌 200；`/health` 无令牌与错令牌都是 401；正确令牌 200 |
+| 405 vs 404 区分 | ✅ | `/nope`→404；`GET /train`→405；`POST /runs`→405 |
+| `cargo test --lib` | ✅ **60 passed / 0 failed / 3 ignored** | 改前 43；新增 8 项真 HTTP + 5 项 runs + 3 项 runstate |
+| clippy | ✅ 新增代码零警告 | 余下 8 条均为既有代码的 collapsible-if / 兼容字段建议 |
+| 真实训练进程不残留 | ✅ | `/train` 测试会真启动引擎，`Drop` 里 `kill_now()`；跑完 `tasklist` 无 montgomery |
+
+**这一轮实测抓到的两个问题**（都是测试自己暴露的，不是想出来的）：
+
+1. **按 mtime 秒级排序会乱**：同一秒内建的两个 run 退化成按名字排序，`train-a` 排在
+   `train-c` 前面。改成用完整 `SystemTime` 排序、只在展示时降到秒。
+2. **`read_to_end` 在 Windows 回环上会报 `ConnectionReset`**：数据其实已经完整收到
+   （511 字节 = header + body 全对），是服务端关闭时内核还有未读字节导致 RST。真实客户端
+   （curl/reqwest）按 `Content-Length` 读，测试也必须这么做——否则会误判成"服务端崩了"。
+
+**未验证**：打包版窗口里的设置页没有改动，本轮只碰后端与 HTTP 面；没有做多客户端并发压力；
+没有在真实 AI 客户端（长会话、中断重连）上跑过端到端。
 
 ## 已实测通过
 

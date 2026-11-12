@@ -11,8 +11,11 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::engine::{Engine, Message, TrainRequest};
-use crate::runstate::RunState;
+use crate::engine::{Engine, TrainRequest};
+// Only `record` (test-only) names this; production folding lives in the subscriber thread.
+#[cfg(test)]
+use crate::engine::Message;
+use crate::runstate::{Delta, RunState};
 use crate::settings::{self, Settings};
 
 /// What the settings page renders, and what `GET /settings` returns. Identical on purpose: one
@@ -77,7 +80,7 @@ impl Runtime {
     pub fn new(config_dir: PathBuf, app_data_dir: PathBuf) -> Self {
         let store = settings::Store::new(config_dir.join("settings.json"));
         let current = store.load();
-        Self(Arc::new(Inner {
+        let runtime = Self(Arc::new(Inner {
             engine: Engine::default(),
             store,
             settings: Mutex::new(current),
@@ -86,7 +89,28 @@ impl Runtime {
             run: Mutex::new(RunState::default()),
             control: Mutex::new(ControlInfo::default()),
             control_handle: Mutex::new(None),
-        }))
+        }));
+
+        // Fold engine messages here, not in the Tauri setup. The hub fans out to every subscriber
+        // (`Vec<mpsc::Sender>`), so the window gets its own copy in `lib.rs`; putting the fold
+        // there instead made the HTTP contract depend on the UI thread being alive. A process
+        // with no window — a test, or a future headless mode — would then answer `idle` forever
+        // while the engine trained happily.
+        //
+        // `Weak`, not `Arc`: a recorder holding a strong reference would keep this Runtime alive
+        // for the life of the process, so dropping the last real owner would never end the thread.
+        let weak = Arc::downgrade(&runtime.0);
+        let receiver = runtime.0.engine.subscribe();
+        std::thread::spawn(move || {
+            for message in receiver {
+                let Some(inner) = weak.upgrade() else { break };
+                if let Ok(mut run) = inner.run.lock() {
+                    run.apply(&message);
+                }
+            }
+        });
+
+        runtime
     }
 
     pub fn engine(&self) -> &Engine {
@@ -151,23 +175,37 @@ impl Runtime {
         let current = self.settings();
         let exe = crate::engine::resolve(current.engine_path.as_deref())?;
         let output = self.output_root();
-        // Clear first: a client that polls immediately after POST /train must see "running", not
-        // the previous run's `done` with its old weights.
+        // Announce the run before spawning. Between this call and the engine's first `start`
+        // event there is a multi-second tensor-initialisation window, and a client polling in it
+        // must see `running` — `idle` reads as "the request was ignored".
         if let Ok(mut run) = self.0.run.lock() {
-            run.reset();
+            run.begin(request.epochs);
         }
-        self.0
+        match self
+            .0
             .engine
             .start(&exe, &output, request, &current.default_device)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                // Nothing started, so `running` would be a lie that outlives the response body.
+                if let Ok(mut run) = self.0.run.lock() {
+                    run.fail(&error);
+                }
+                Err(error)
+            }
+        }
     }
 
     pub fn stop_training(&self) -> Result<(), String> {
         self.0.engine.stop()
     }
 
-    /// Fold one engine message into the shared snapshot. Called from the single hub subscriber in
-    /// `lib.rs`, before the message is forwarded to the window, so both front ends observe the
-    /// same order.
+    /// Fold one engine message into the snapshot without going through the hub.
+    ///
+    /// Production folding happens on the subscriber thread started in `new`; this exists so a
+    /// test can drive the snapshot from a known message sequence without starting an engine.
+    #[cfg(test)]
     pub fn record(&self, message: &Message) {
         if let Ok(mut run) = self.0.run.lock() {
             run.apply(message);
@@ -181,14 +219,19 @@ impl Runtime {
         }
     }
 
-    /// `(cursor, events newer than since)` for `GET /events`.
-    pub fn events_since(&self, since: u64) -> (u64, Vec<Value>) {
+    /// `(cursor, events newer than since)` for `GET /events`, plus the flags that tell the caller
+    /// why it may be seeing more or less than it asked for.
+    pub fn events_since(&self, since: u64) -> Delta {
         match self.0.run.lock() {
-            Ok(run) => {
-                let (cursor, events) = run.since(since);
-                (cursor, events.into_iter().cloned().collect())
-            }
-            Err(_) => (since, Vec::new()),
+            Ok(run) => run.since(since),
+            // A poisoned lock must not take the service down. An empty delta is a truthful "I
+            // cannot see any events right now", and the client retries on its next poll.
+            Err(_) => Delta {
+                cursor: since,
+                reset: false,
+                truncated: false,
+                events: Vec::new(),
+            },
         }
     }
 
@@ -275,6 +318,7 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::Message;
 
     fn temp_runtime() -> (Runtime, PathBuf) {
         // A unique directory per test: settings are file-backed, and two tests sharing one file

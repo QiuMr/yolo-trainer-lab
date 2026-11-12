@@ -1,5 +1,75 @@
 # 变更记录
 
+## 2026-11-13 · 修「AI 接口在无窗口进程里看不到进度」与三处资源/语义缺陷
+
+起因是给控制服务补真实端到端测试，第一次跑就暴露了三个问题。决策与被否决方案见 D031。
+
+- **状态折叠从 Tauri `setup` 移进 `Runtime::new`（架构）**：hub 是 `Vec<mpsc::Sender>` 的扇出
+  结构，但折叠逻辑写在 `lib.rs` 的窗口订阅线程里。结果 **HTTP 接口能否看到进度，取决于 UI 层
+  那个线程是否存在**。测试里没有它，于是 `/train` 返回 202 之后 `/state` 永远是 `idle`、`seq`
+  永远是 0，而引擎在旁边正常训练。现在 `Runtime::new` 自己订阅一份并折叠，`lib.rs` 只负责
+  转发给窗口。折叠线程持 `Weak`，否则它会把这个 Runtime 钉住，最后一个真实持有者释放后线程也不会结束。
+- **`POST /train` 后状态立即是 `running`**：此前走 `reset()`，状态回到 `idle`。而 `202` 与引擎
+  第一个 `start` 事件之间有几十秒的初始化，调用方在这段时间轮询到 `idle` 会以为请求被忽略，
+  重发一次 `/train`，拿到 `409`。新增 `RunState::begin(epochs)` 承担这个语义，
+  `reset()` 因为不再有调用者被删除。
+- **引擎启动失败不再卡在 `running`**：新增 `RunState::fail()`，经 `apply` 记一个
+  `error{code:"spawn_failed"}` 事件，所以它同时出现在 `/events` 里。此前失败后状态语义混乱，
+  调用方可能一直等一个不会来的进度。
+- **并发连接上限 64，超限返回 `503`**：每连接一个线程、最长存活 30 秒，轮询不加间隔的客户端
+  能把线程堆起来。用 `Arc<AtomicUsize>` + RAII guard 计数（handler panic 也会归还名额）；
+  改用 `Builder::spawn` 而不是 `thread::spawn`——后者在线程创建失败时会 panic 掉 accept 循环，
+  服务从此不可达。拒绝前先排空客户端已发的数据，否则内核发 RST，调用方看到的是
+  「连接被重置」而不是那条说明原因的 `503`。
+- **新增 `end_to_end_assistant_flow`（`#[ignore]`）**：真实 HTTP + 真实引擎 + 真实数据集，
+  按 AI 的完整顺序走 `health → 两个 scan 入口 → 任务不匹配 400 → 空转 /stop → /train →
+  轮询到 done → /runs → /predict`。3.5 秒跑完，替代了此前"只有纯函数测试"的状态。
+- **`README.md`**：原文写「63 个模型」「用预训练权重需要 Python 转换」，
+  都与实际能力不符（45 个；预训练权重按需自动下载）。补上完整的「用 AI 操控」章节——
+  端口、令牌位置、可粘贴的六步流程，以及代理与退避两个实测坑。
+- **`docs/API.md`**：补 `202` 后即为 `running` 的时序、`spawn_failed`、`503` 的语义，
+  以及 `/runs` 与 `/state` 的路径分隔符不保证一致（应比较文件系统解析结果，而不是字符串）。
+
+## 2026-11-13 · AI 操控接口第二轮：能找得到产物，不再误导调用方
+
+目标只有两条：**好用**（AI 拿得到它需要的信息）、**不误导**（错的答案比没有答案更贵）。
+决策与被否决方案见 D030。
+
+- **`src/runs.rs`（新）**：扫描 `runs/<task>/<run>/`，解析 `config.resolved.json` 拿任务的
+  真实身份与类别，解析 `results.csv` 拿进度与指标。`results.csv` **按列名解析**——表头随任务
+  变化，按位置读会在引擎加列那天静默返回错数字。
+- **`GET /runs`（新端点）**：返回历史运行、可用产物（`best`）、能否续训（`resumable`）、
+  最后一轮 loss 与 fitness、类别表，按 mtime 倒序。**这是应用重启后找到旧模型的唯一途径**：
+  `/state` 是进程内快照，重启即失忆，而磁盘上的 `best.bpk` 一直在。
+- **`POST /datasets/scan`（新入口）**：路径放 JSON body，中文目录名不必手工 percent-encode。
+  GET 版本保持不变，两者返回同一份 `DatasetSummary`（有测试断言两者逐字段相等）。
+- **`/state` / `/events` 的增量语义变显式**：响应加 `reset`（cursor 来自上一个进程，已从缓冲区
+  开头重放）与 `truncated`（环形缓冲区挤掉了你错过的事件），两者**总是出现**。此前这两种情况
+  都是静默的：把 cursor 存盘的客户端在应用重启后会永远问 `since=500` 而新进程才到 3，
+  于是永远收不到事件。
+- **`RunState.last_fitness`（新字段）**：验证适应度。此前只记 `last_loss`，而本项目在
+  tiny 数据集上真实出现过 loss 一路降、mAP 始终为 0 的情况——只看 loss 判断不了模型好坏。
+  `--no-val` 时为 `null` 而不是 `0`。
+- **`POST /train` 开训前预检任务与数据集是否匹配**：`-cls` 配 YOLO 数据集、或无后缀配类别
+  文件夹数据集，直接 `400` 并说明该改架构还是该换数据集。规则与界面 `taskProblem()` 一致。
+  扫描器不认的格式（COCO）放行，交给引擎报错——不能因为扫描器不会读就拦住引擎能读的数据。
+- **`accepted.device` 回显生效值**：`device` 只接受 `auto`/`cpu`/`gpu`，其他归一化成 `auto`，
+  改写原因进新的 `warnings` 数组。此前回显请求原文，叫 `gpu` 却静默跑 `auto` 的调用方无从察觉。
+  `warnings` 也会带数据集的问题（如"没有验证集"）。
+- **`/predict` 按责任方分 `400` / `500`**：引擎崩溃曾报成 `400`，客户端于是一直调参数。
+- **`/stop` 不再说谎**：没有训练在跑时返回 `stopped: false` + 说明，而不是 `stopped: true`。
+- **`settings::normalize_device()` 成为唯一来源**：引擎 spawn 路径与 HTTP 服务此前各有一份
+  白名单规则，这正是 `accepted.device` 能说谎的根因。
+- **HTTP 集成测试 8 项（新）**：此前所有测试都是纯函数，**没有一条真正起过监听端口**。新增的
+  测试起真实服务、按 `Content-Length` 读响应，覆盖鉴权顺序、405 vs 404、两个 scan 入口一致、
+  cursor 倒退、`/runs` 读盘、`/stop` 语义、device 回显、任务不匹配阻断。
+- **`real_runs_directory_parses`（ignored）**：用本机真实产出的 15 个 run 验证解析器，
+  断言的是"我以为引擎写什么"之外的现实。
+
+**实测**：`cargo test --lib` **60 passed / 0 failed / 3 ignored**（改前 43）；clippy 新增代码
+零警告（余下 8 条均为既有代码的风格建议）。真实目录 15 个 run 全部解析正确，其中 4 个
+`epochs=0 / resumable=false` 的空壳 run 被如实区分出来。
+
 ## 2026-11-11 晚上 · 预训练权重按需下载（不占安装包）
 
 用户提出"权重放 GitHub，需要时自动下载，就像更新一样"。这样安装包保持 29 MB，

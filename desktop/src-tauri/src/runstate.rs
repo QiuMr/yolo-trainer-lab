@@ -25,6 +25,10 @@ pub struct RunState {
     pub epoch: u32,
     pub total_epochs: u32,
     pub last_loss: Option<f64>,
+    /// Validation fitness from the last epoch. This is the number that actually says whether the
+    /// model is any good — `last_loss` alone cannot separate "learning" from "memorising". `None`
+    /// when running with `--no-val`, where the engine emits no validation at all.
+    pub last_fitness: Option<f64>,
     pub last_epoch_seconds: Option<f64>,
     /// What the engine actually used, not what was requested.
     pub backend: Option<String>,
@@ -50,6 +54,7 @@ impl Default for RunState {
             epoch: 0,
             total_epochs: 0,
             last_loss: None,
+            last_fitness: None,
             last_epoch_seconds: None,
             backend: None,
             adapter: None,
@@ -64,16 +69,53 @@ impl Default for RunState {
     }
 }
 
+/// What `GET /events?since=N` answers with.
+#[derive(Debug, Clone, Serialize)]
+pub struct Delta {
+    /// Send this back as `since` next time.
+    pub cursor: u64,
+    /// The caller's cursor was **ahead** of this process's counter. `seq` is per-process and
+    /// starts at 0, so this is what a cursor saved before a restart looks like: `since=500` while
+    /// the fresh process is at `seq=3`. Rather than returning an empty list until the counter
+    /// climbs past 500 — which a client that only advances its cursor on a non-empty response
+    /// would never escape — the events are replayed from the start of the buffer.
+    pub reset: bool,
+    /// At least one event between the caller's cursor and the oldest retained one was dropped.
+    /// The buffer holds `MAX_EVENTS`; engine log lines are events too, so a chatty run can push
+    /// old epochs out. Worth surfacing: a client that misses an `end` event and is told "nothing
+    /// new" polls forever.
+    pub truncated: bool,
+    pub events: Vec<Value>,
+}
+
 impl RunState {
-    /// Clear the previous run. Called when a new one is accepted, not when the first event
-    /// arrives: a client that starts a run and immediately polls must not see the last run's
-    /// numbers and conclude it already finished.
-    pub fn reset(&mut self) {
+    /// Announce a run before the engine has said anything about it.
+    ///
+    /// `reset` alone leaves the status at `idle`, and there is a real gap between `POST /train`
+    /// returning `202` and the engine's `start` event — initialising the tensors takes tens of
+    /// seconds on this hardware. A client polling in that window sees `idle`, concludes the
+    /// request was ignored, and re-sends it, which now fails with `409`. `running` is the honest
+    /// answer: the work has been accepted.
+    pub fn begin(&mut self, epochs: u32) {
         let seq = self.seq;
         *self = Self {
             seq,
+            status: "running".into(),
+            total_epochs: epochs,
             ..Self::default()
         };
+    }
+
+    /// The engine never started — bad path, spawn refused. Recorded through `apply` so the failure
+    /// also shows up in `/events`; leaving `running` up would make a client poll until its own
+    /// timeout with no explanation.
+    pub fn fail(&mut self, message: &str) {
+        self.apply(&Message::Event(json!({
+            "type": "error",
+            "code": "spawn_failed",
+            "message": message,
+            "hint": "检查设置里的引擎路径是否存在，或改用内置引擎。"
+        })));
     }
 
     /// Fold one hub message in. Log lines are kept as `{type:"log"}` events so that a client
@@ -107,6 +149,7 @@ impl RunState {
                     self.total_epochs = total as u32;
                 }
                 self.last_loss = number(&value, "loss");
+                self.last_fitness = number(&value, "fitness");
                 self.last_epoch_seconds = number(&value, "elapsed_s");
             }
             Some("end") => {
@@ -142,15 +185,27 @@ impl RunState {
     /// Everything newer than `since`, plus the cursor the caller should send next.
     ///
     /// A caller that has fallen off the back of the ring buffer gets whatever is still retained
-    /// rather than an error: a gap is tolerable, a 500 is not.
-    pub fn since(&self, since: u64) -> (u64, Vec<&Value>) {
-        let events = self
+    /// rather than an error: a gap is tolerable, a 500 is not. What is *not* tolerable is a gap
+    /// the caller cannot see, hence `truncated`.
+    pub fn since(&self, since: u64) -> Delta {
+        let reset = since > self.seq;
+        let effective = if reset { 0 } else { since };
+        let truncated = self
             .events
-            .iter()
-            .filter(|(seq, _)| *seq > since)
-            .map(|(_, value)| value)
-            .collect();
-        (self.seq, events)
+            .front()
+            .map(|(oldest, _)| *oldest > effective.saturating_add(1))
+            .unwrap_or(false);
+        Delta {
+            cursor: self.seq,
+            reset,
+            truncated,
+            events: self
+                .events
+                .iter()
+                .filter(|(seq, _)| *seq > effective)
+                .map(|(_, value)| value.clone())
+                .collect(),
+        }
     }
 }
 
@@ -207,20 +262,92 @@ mod tests {
         let mut state = RunState::default();
         state.apply(&event(json!({ "type": "start", "epochs": 1 })));
         state.apply(&Message::Log("hello".into()));
-        let (cursor, events) = state.since(1);
-        assert_eq!(cursor, 2);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0]["type"], "log");
+        let delta = state.since(1);
+        assert_eq!(delta.cursor, 2);
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0]["type"], "log");
+        assert!(!delta.reset && !delta.truncated);
     }
 
+    /// Validation fitness is the only number that says whether the model is any good; dropping it
+    /// left an AI client with `last_loss`, which happily decreases on a model that has memorised
+    /// four images.
     #[test]
-    fn reset_keeps_the_cursor() {
+    fn validation_fitness_is_recorded() {
+        let mut state = RunState::default();
+        state.apply(&event(json!({
+            "type": "epoch", "epoch": 1, "epochs": 2, "loss": 3.5, "fitness": 0.0421
+        })));
+        assert_eq!(state.last_fitness, Some(0.0421));
+
+        // `--no-val` emits `fitness: null`; that must read as "not measured", not as 0.0.
+        state.apply(&event(json!({
+            "type": "epoch", "epoch": 2, "epochs": 2, "loss": 3.1, "fitness": null
+        })));
+        assert_eq!(state.last_fitness, None);
+    }
+
+    /// A client that saved its cursor before the app restarted holds a number the new process has
+    /// never reached. Returning "nothing new" forever is the failure this guards against.
+    #[test]
+    fn cursor_from_a_previous_process_replays_instead_of_stalling() {
         let mut state = RunState::default();
         state.apply(&event(json!({ "type": "start", "epochs": 1 })));
+        // seq is now 1, but the client is still asking from 500.
+        let delta = state.since(500);
+        assert!(delta.reset, "must be flagged so the client can tell it restarted");
+        assert_eq!(delta.cursor, 1);
+        assert_eq!(delta.events.len(), 1, "the retained events are replayed, not dropped");
+    }
+
+    /// The ring buffer is finite and log lines count, so old events can disappear. A client has to
+    /// be able to tell "nothing new" from "you missed some".
+    #[test]
+    fn truncation_is_visible() {
+        let mut state = RunState::default();
+        for index in 0..(MAX_EVENTS + 25) {
+            state.apply(&Message::Log(format!("line {index}")));
+        }
+        let delta = state.since(0);
+        assert!(delta.truncated, "25 events were evicted and the caller must know");
+        assert_eq!(delta.events.len(), MAX_EVENTS);
+
+        // Polling often enough keeps the flag off.
+        let fresh = state.since(state.seq - 1);
+        assert!(!fresh.truncated);
+    }
+
+    /// There is a real window between `POST /train` returning 202 and the engine's first event —
+    /// initialising the tensors takes tens of seconds here. A client polling in that window used
+    /// to see `idle`, conclude the request was ignored, and re-send it, which then failed 409.
+    #[test]
+    fn begin_announces_the_run_before_the_engine_does() {
+        let mut state = RunState::default();
+        state.apply(&event(json!({ "type": "end", "best": "old/best.bpk" })));
         let cursor = state.seq;
-        state.reset();
-        assert_eq!(state.seq, cursor, "cursor must not go backwards");
-        assert_eq!(state.status, "idle");
-        assert_eq!(state.epoch, 0);
+
+        state.begin(20);
+        assert_eq!(state.status, "running");
+        assert_eq!(state.total_epochs, 20);
+        assert_eq!(state.best, None, "the previous run's artifact must not carry over");
+        assert_eq!(
+            state.seq, cursor,
+            "nothing has happened yet, so the cursor must stand still"
+        );
+    }
+
+    /// A spawn failure has to read as `failed`. Leaving `running` up makes every client poll until
+    /// its own timeout with no explanation.
+    #[test]
+    fn failed_spawn_is_recorded_as_failure() {
+        let mut state = RunState::default();
+        state.begin(5);
+        state.fail("引擎不存在");
+        assert_eq!(state.status, "failed");
+        assert_eq!(state.error.as_ref().unwrap()["code"], "spawn_failed");
+        // Recorded through `apply`, so it also reaches `/events` as a real event.
+        let delta = state.since(0);
+        assert_eq!(delta.events.len(), 1);
+        assert_eq!(delta.events[0]["type"], "error");
     }
 }

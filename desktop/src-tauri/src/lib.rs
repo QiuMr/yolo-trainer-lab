@@ -13,6 +13,7 @@
 //! | [`engine`] | locate the exe, spawn it, fan events out through a hub | no |
 //! | [`settings`] | load/save user settings from one JSON file | no |
 //! | [`runstate`] | fold hub events into one readable snapshot | no |
+//! | [`runs`] | discover finished runs on disk (what `/state` cannot know after a restart) | no |
 //! | [`runtime`] | the state both front ends share (settings, engine, snapshot, control) | no |
 //! | [`control`] | local HTTP service that lets an AI client drive the app | no |
 //! | [`tray`] | tray icon, show/hide, quit | yes |
@@ -34,6 +35,7 @@ mod onnx_export;
 mod predict;
 mod pretrained;
 mod runstate;
+mod runs;
 mod runtime;
 mod settings;
 mod tray;
@@ -102,6 +104,7 @@ fn predict_image(
     }
     let default_dir = runtime.output_root().join("predictions");
     predict::run(&engine, &request, &model, &default_dir)
+        .map_err(|error| error.message().to_owned())
 }
 
 /// Export the current model as ONNX. Blocking for the same reason as `predict_image`: the engine
@@ -224,14 +227,13 @@ pub fn run() {
             let runtime = Runtime::new(config_dir, data_dir);
             app.manage(runtime.clone());
 
-            // The single bridge between the engine hub and both front ends. The snapshot is
-            // updated here rather than in the HTTP layer so that the window and an AI client can
-            // never disagree about how far a run has got.
-            let hub_runtime = runtime.clone();
+            // The window's subscriber. The snapshot is folded in `Runtime::new` because the hub
+            // fans out to every subscriber; this thread only forwards to the UI. Keeping the fold
+            // out of here is what lets the control service report progress with no window open.
+            let receiver = runtime.engine().subscribe();
             let handle = app.handle().clone();
             std::thread::spawn(move || {
-                for message in hub_runtime.engine().subscribe() {
-                    hub_runtime.record(&message);
+                for message in receiver {
                     match message {
                         engine::Message::Event(value) => {
                             let _ = handle.emit("engine-event", value);

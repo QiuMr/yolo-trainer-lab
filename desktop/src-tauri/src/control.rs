@@ -34,6 +34,22 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// One thread per connection, so the count is the thread count. A client in a fast retry loop
+/// (an assistant that polls without sleeping is the realistic case) can create threads faster
+/// than they retire; each one lives up to `IO_TIMEOUT`. 64 is far above what one local client
+/// needs and far below anything that would hurt the UI process.
+const MAX_CONNECTIONS: usize = 64;
+
+/// Holds one unit of the live-connection count for as long as a handler runs. Drop is the only
+/// decrement path, so a panicking handler still gives its slot back.
+struct LiveSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for LiveSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// A running service. Cheap to clone; `stop` is the only way to end it, and it is synchronous
 /// (it waits for the accept loop to release the listening socket).
 #[derive(Clone)]
@@ -89,6 +105,7 @@ pub fn start(runtime: Runtime, requested_port: u16) -> Result<Handle, String> {
     let worker_runtime = runtime.clone();
     let worker_token = token.clone();
     let worker_stop = stop.clone();
+    let live = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let worker = std::thread::spawn(move || {
         while !worker_stop.load(Ordering::Relaxed) {
             match listener.accept() {
@@ -96,9 +113,27 @@ pub fn start(runtime: Runtime, requested_port: u16) -> Result<Handle, String> {
                     // Accepted sockets inherit the listener's non-blocking flag on Windows; the
                     // per-request reader assumes blocking IO.
                     let _ = stream.set_nonblocking(false);
+
+                    // Claim the slot before spawning so the count and the thread start together.
+                    if live.fetch_add(1, Ordering::Relaxed) >= MAX_CONNECTIONS {
+                        live.fetch_sub(1, Ordering::Relaxed);
+                        refuse(stream);
+                        continue;
+                    }
+                    let slot = LiveSlot(live.clone());
                     let runtime = worker_runtime.clone();
                     let token = worker_token.clone();
-                    std::thread::spawn(move || handle(stream, &runtime, &token, started));
+                    // `Builder::spawn` returns a Result; `thread::spawn` would panic. Killing the
+                    // accept loop makes the service unreachable for good, which is strictly worse
+                    // than refusing one connection.
+                    let spawned = std::thread::Builder::new().spawn(move || {
+                        let _slot = slot;
+                        handle(stream, &runtime, &token, started);
+                    });
+                    if let Err(error) = spawned {
+                        // Dropping the closure dropped the guard, so the slot is already back.
+                        eprintln!("[control] 无法创建连接线程：{error}");
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(120));
@@ -168,14 +203,7 @@ struct Request {
     method: String,
     path: String,
     query: HashMap<String, String>,
-    headers: HashMap<String, String>,
     body: Vec<u8>,
-}
-
-impl Request {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(name).map(String::as_str)
-    }
 }
 
 struct Response {
@@ -221,6 +249,24 @@ impl Response {
             _ => "Unknown",
         }
     }
+}
+
+/// Rejects one connection when the limit is hit. This runs on the accept thread, so the write
+/// timeout must be short — a client that stops reading must not delay acceptance for everyone
+/// else. A real status beats a bare close: the caller can tell "back off" from "not listening".
+fn refuse(mut stream: TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    // Drain what the client already sent first: closing a socket that still holds unread data
+    // makes the kernel answer with RST, and the caller would see "connection reset" instead of
+    // the 503 that explains why it was refused. One read is enough for the request heads that
+    // reach here — anything larger is a client that was going to be refused anyway.
+    let mut scratch = [0u8; 2048];
+    let _ = stream.read(&mut scratch);
+    let _ = write_response(
+        &mut stream,
+        &Response::error(503, "并发连接过多，请退避后重试。"),
+    );
 }
 
 fn handle(mut stream: TcpStream, runtime: &Runtime, token: &str, started: Instant) {
@@ -367,7 +413,6 @@ fn read_request(
         method,
         path,
         query,
-        headers,
         body,
     }))
 }
@@ -504,6 +549,48 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 /* ───────────────────────────── routes ───────────────────────────── */
 
+/// `?since=` on `/state` and `/events`. An unparseable or empty value counts as absent rather than
+/// a 400: `?since=` with nothing after it means "from the beginning", which is what the client
+/// wanted anyway, and a 400 there would turn a harmless templating bug into a dead poll loop.
+fn since_param(request: &Request) -> Option<u64> {
+    request
+        .query
+        .get("since")
+        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+/// One body shape for `/state?since=N` and `/events?since=N`.
+///
+/// `reset` and `truncated` are always present rather than only when true: a client should be able
+/// to branch on them without checking for absence, and they answer the two questions a poller
+/// actually has — "did the app restart under me" and "did I miss events".
+fn delta_body(runtime: &Runtime, since: u64, state: Option<Value>) -> Value {
+    let delta = runtime.events_since(since);
+    let mut body = json!({
+        "ok": true,
+        "cursor": delta.cursor,
+        "reset": delta.reset,
+        "truncated": delta.truncated,
+        "events": delta.events,
+    });
+    if let Some(state) = state {
+        body["state"] = state;
+    }
+    body
+}
+
+/// `GET /datasets/scan?path=` and `POST /datasets/scan` answer identically.
+fn scan_dataset(target: &str) -> Response {
+    if target.trim().is_empty() {
+        return Response::error(400, "path 不能为空");
+    }
+    match crate::dataset::scan(target) {
+        Ok(summary) => Response::json(200, json!({ "ok": true, "dataset": summary })),
+        Err(error) => Response::error(400, error),
+    }
+}
+
 fn route(request: &Request, runtime: &Runtime, started: Instant) -> Response {
     let path = request.path.trim_end_matches('/').to_owned();
     let path = if path.is_empty() { "/".to_string() } else { path };
@@ -526,47 +613,78 @@ fn route(request: &Request, runtime: &Runtime, started: Instant) -> Response {
         ),
         ("GET", "/state") => {
             let snapshot = runtime.run_snapshot();
-            let since = request
-                .query
-                .get("since")
-                .and_then(|value| value.parse::<u64>().ok());
-            match since {
-                Some(cursor) => {
-                    let (next, events) = runtime.events_since(cursor);
-                    Response::json(
-                        200,
-                        json!({ "ok": true, "state": snapshot, "cursor": next, "events": events }),
-                    )
-                }
+            match since_param(request) {
+                Some(cursor) => Response::json(200, delta_body(runtime, cursor, Some(snapshot))),
                 None => Response::json(200, snapshot),
             }
         }
         ("GET", "/events") => {
-            let since = request
+            let since = since_param(request).unwrap_or(0);
+            Response::json(200, delta_body(runtime, since, None))
+        }
+        ("GET", "/runs") => {
+            let limit = request
                 .query
-                .get("since")
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(0);
-            let (cursor, events) = runtime.events_since(since);
-            Response::json(200, json!({ "ok": true, "cursor": cursor, "events": events }))
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(50);
+            let root = runtime.output_root();
+            let list = crate::runs::scan(&root, limit);
+            Response::json(
+                200,
+                json!({
+                    "ok": true,
+                    "root": root.to_string_lossy(),
+                    "count": list.len(),
+                    // `/state` forgets everything when the app restarts; this is the only way to
+                    // find the model a previous session trained.
+                    "note": "用 runs[].best 作为 POST /predict 的 model；续训用 runs[].dir + \\checkpoints\\last。",
+                    "runs": list,
+                }),
+            )
         }
         ("POST", "/train") => start_training(request, runtime),
         ("POST", "/predict") => run_prediction(request, runtime),
-        ("POST", "/stop") => match runtime.stop_training() {
-            Ok(()) => Response::json(200, json!({ "ok": true, "stopped": true })),
-            Err(error) => Response::error(500, error),
-        },
+        ("POST", "/stop") => {
+            // Saying `stopped: true` when nothing was running is a lie an assistant will act on:
+            // it will wait for a status change that can never come.
+            if !runtime.engine().is_running() {
+                return Response::json(
+                    200,
+                    json!({
+                        "ok": true,
+                        "stopped": false,
+                        "note": "当前没有训练在跑，没有需要停止的东西。",
+                    }),
+                );
+            }
+            match runtime.stop_training() {
+                Ok(()) => Response::json(200, json!({ "ok": true, "stopped": true })),
+                Err(error) => Response::error(500, error),
+            }
+        }
         ("GET", "/datasets/scan") => {
             let Some(target) = request.query.get("path") else {
-                return Response::error(400, "缺少查询参数 path=/数据集/目录");
+                return Response::error(
+                    400,
+                    "缺少查询参数 path=/数据集/目录。中文路径不方便 percent-encode 时，\
+                     改用 POST /datasets/scan，body 为 {\"path\":\"E:/数据\"}。",
+                );
             };
-            if target.trim().is_empty() {
-                return Response::error(400, "path 不能为空");
-            }
-            match crate::dataset::scan(target) {
-                Ok(summary) => Response::json(200, json!({ "ok": true, "dataset": summary })),
-                Err(error) => Response::error(400, error),
-            }
+            scan_dataset(target)
+        }
+        // The same scan through a JSON body: a Windows path with Chinese folder names needs
+        // percent-encoding in a query string, and getting that wrong produces a 404-looking
+        // "path does not exist" that an assistant will try to debug in the wrong place.
+        ("POST", "/datasets/scan") => {
+            let parsed: Value = match serde_json::from_slice(&request.body) {
+                Ok(value) => value,
+                Err(error) => return Response::error(400, format!("JSON 解析失败：{error}")),
+            };
+            let Some(target) = parsed.get("path").and_then(Value::as_str) else {
+                return Response::error(400, "缺少 path：数据集目录或 dataset.yaml 的绝对路径。");
+            };
+            scan_dataset(target)
         }
         ("GET", "/settings") => {
             Response::json(200, json!({ "ok": true, "settings": runtime.view() }))
@@ -585,8 +703,17 @@ fn route(request: &Request, runtime: &Runtime, started: Instant) -> Response {
         // error honest for an AI client that is probing the API.
         (method, path)
             if [
-                "/", "/index.md", "/health", "/state", "/events", "/train", "/stop",
-                "/predict", "/datasets/scan", "/settings",
+                "/",
+                "/index.md",
+                "/health",
+                "/state",
+                "/events",
+                "/runs",
+                "/train",
+                "/stop",
+                "/predict",
+                "/datasets/scan",
+                "/settings",
             ]
             .contains(&path) =>
         {
@@ -657,6 +784,7 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
         .unwrap_or("")
         .trim()
         .to_owned();
+    let mut warnings: Vec<String> = Vec::new();
     if needs_dataset {
         if dataset.is_empty() {
             return Response::error(
@@ -670,6 +798,31 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
         let dataset_path = Path::new(&dataset);
         if dataset_path.is_dir() && !dataset_path.join("dataset.yaml").is_file() {
             return Response::error(400, format!("目录里没有 dataset.yaml：{dataset}"));
+        }
+
+        // A classification architecture pointed at a detection dataset is the mistake an
+        // assistant makes most often. The window already refuses it (`models.ts::taskProblem`);
+        // over HTTP nothing did, so the run started, spent a minute loading weights, and then
+        // died with the engine's own wording.
+        if let TrainInit::Scratch { architecture } = &init {
+            match task_of_architecture(architecture) {
+                Err(message) => return Response::error(400, message),
+                Ok(task) => {
+                    // The scanner understands the two layouts the UI offers; the engine also
+                    // reads COCO. A dataset this scanner cannot parse must not be blocked here —
+                    // the engine's own error is the right answer for it.
+                    if let Ok(summary) = crate::dataset::scan(&dataset) {
+                        if let Some(problem) = task_mismatch(task, &summary.format) {
+                            return Response::error(400, problem);
+                        }
+                        // "No validation split" is worth telling the client now, not after mAP
+                        // comes back as zero.
+                        if let Some(warning) = summary.warning {
+                            warnings.push(warning);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -689,17 +842,27 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
     }
 
     let defaults = runtime.settings();
+    let requested_device = partial
+        .get("device")
+        .and_then(Value::as_str)
+        .unwrap_or(&defaults.default_device)
+        .trim()
+        .to_owned();
+    // Echo what the engine will actually receive, not what was asked for. The spawn path coerces
+    // anything outside `auto` / `cpu` / `gpu`, and a caller that asked for `gpu` while silently
+    // getting `auto` had no way to notice from the old response.
+    let device = settings::normalize_device(&requested_device, &defaults.default_device);
+    if !requested_device.is_empty() && device != requested_device {
+        warnings.push(format!("device 只接受 auto / cpu / gpu，已改成 {device}。"));
+    }
+
     let train = TrainRequest {
         init,
         dataset,
         epochs,
         batch,
         imgsz,
-        device: partial
-            .get("device")
-            .and_then(Value::as_str)
-            .unwrap_or(&defaults.default_device)
-            .to_owned(),
+        device,
     };
 
     let accepted = json!({
@@ -712,6 +875,8 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
             "imgsz": train.imgsz,
             "device": train.device,
         },
+        // Empty most of the time. A client that ignores this field got exactly what it asked for.
+        "warnings": warnings,
         "note": "已开始。轮询 GET /state 或 GET /events?since=<cursor> 获取进度。"
     });
 
@@ -771,7 +936,11 @@ fn run_prediction(request: &Request, runtime: &Runtime) -> Response {
     let default_dir = runtime.output_root().join("predictions");
     match crate::predict::run(&engine, &parsed, &model, &default_dir) {
         Ok(result) => Response::json(200, json!({ "ok": true, "result": result })),
-        Err(error) => Response::error(400, error),
+        // 400 means "fix your request", 500 means "the engine or the disk failed". Reporting both
+        // as 400 sent clients into a parameter-tuning loop when the real problem was a model the
+        // engine could not load.
+        Err(crate::predict::PredictError::BadRequest(message)) => Response::error(400, message),
+        Err(crate::predict::PredictError::Internal(message)) => Response::error(500, message),
     }
 }
 
@@ -780,6 +949,48 @@ fn uint(value: &Value, key: &str) -> Option<u32> {
         .get(key)
         .and_then(Value::as_u64)
         .and_then(|number| u32::try_from(number).ok())
+}
+
+/// Which task an architecture ID trains, decided by its suffix — the same rule `models.ts` uses
+/// to build the IDs (`prefix + scale`, then `-seg` / `-cls`).
+fn task_of_architecture(architecture: &str) -> Result<&'static str, String> {
+    if architecture.ends_with("-sem") || architecture.ends_with("-depth") {
+        return Err(format!(
+            "{architecture} 只能推理，不能训练：引擎没有对应的损失与标注管线。\
+             检测用 yolo26n，实例分割用 yolo26n-seg，分类用 yolo26n-cls。"
+        ));
+    }
+    if architecture.ends_with("-seg") {
+        return Ok("segment");
+    }
+    if architecture.ends_with("-cls") {
+        return Ok("classify");
+    }
+    Ok("detect")
+}
+
+/// `None` when the dataset layout can serve this task.
+///
+/// The scanner reports `imagenet-folders` while the engine's own `dataset.json` writes
+/// `classification-folders`; both are accepted so the check does not depend on which layer named
+/// the layout.
+fn task_mismatch(task: &str, format: &str) -> Option<String> {
+    const CLASSIFY_FORMATS: [&str; 2] = ["imagenet-folders", "classification-folders"];
+    match task {
+        "classify" if !CLASSIFY_FORMATS.contains(&format) => Some(format!(
+            "分类模型需要按类别分文件夹的数据集（train/<类别名>/*.jpg），但这是 {format} 格式。\
+             要么把 architecture 的后缀去掉（例如 yolo26n-cls → yolo26n）做检测/分割，\
+             要么换一个分类数据集。"
+        )),
+        "detect" | "segment" if format != "yolo" => {
+            let label = if task == "segment" { "实例分割" } else { "检测" };
+            Some(format!(
+                "{label}任务需要 YOLO 格式数据集（images/ + labels/），但这是 {format}。\
+                 分类数据集请用 -cls 结尾的架构，例如 yolo26n-cls。"
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Model IDs are `yolo26n`, `yolov8x-seg`, `yolo26n-cls`, `yolox-tiny`, … . Rejecting a leading
@@ -830,6 +1041,8 @@ fn guide(runtime: &Runtime) -> String {
 | POST | `/stop` | 中止训练 |
 | POST | `/predict` | 用训练好的模型给一张图推理 |
 | GET | `/datasets/scan?path=...` | 检查一个数据集目录是否可用 |
+| POST | `/datasets/scan` | 同上，但路径放在 JSON body 里（中文路径免 percent-encode） |
+| GET | `/runs` | 列出历史训练与产物（应用重启后找旧模型的唯一途径） |
 | GET | `/settings` | 读配置 |
 | PUT | `/settings` | 改配置（整体替换，缺字段用默认值） |
 
@@ -839,17 +1052,34 @@ fn guide(runtime: &Runtime) -> String {
 
 ## 典型流程
 
+0. 先看有没有已经训好的模型。应用重启后 `/state` 是空的（它只记得本进程跑过的训练），
+   但磁盘上的产物还在：
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" "{base}/runs?limit=10"
+```
+
+`runs[]` 每项里：`best` 可以直接当 `/predict` 的 `model`；`resumable` 为 true 时可以用
+`{{"init":{{"mode":"resume","checkpoint":"<dir>/checkpoints/last"}}}}` 接着上次训；
+`final_loss` 和 `final_fitness` 是最后一轮的训练损失与验证指标——**判断模型好坏看
+`final_fitness`，只看 loss 会漏掉过拟合**；`classes` 是它能识别的类别。列表按修改时间倒序。
+
 1. 先扫描数据集，确认类别和图片数，别拿坏数据集去训练：
 
 ```bash
 curl -s -H "Authorization: Bearer $TOKEN" \
   "{base}/datasets/scan?path=E:/data/coco-mini"
+
+# 路径里有中文或空格时，用 POST 更省事，不必手工 percent-encode：
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{{"path":"E:/工作区/数据/coco-mini"}}' "{base}/datasets/scan"
 ```
 
 返回 `dataset.train_images`、`dataset.classes`、`dataset.missing_labels`、`dataset.warning`。
 `missing_labels > 0` 说明有图片没标注，可以训练但效果会打折；`train_images == 0` 就别开始。
 `dataset.format` 是 `yolo`（检测/分割）或 `imagenet-folders`（分类），任务与格式必须匹配：
-分类只能用 `imagenet-folders`，检测和分割只能用 `yolo`。
+分类只能用 `imagenet-folders`，检测和分割只能用 `yolo`。**`/train` 会替你查这一条**，
+架构与数据集不匹配时直接返回 400 并说明该改哪一边，不会先跑一分钟再失败。
 
 2. 开始训练（`epochs` 是轮数，`batch` 是批大小，`device` 是 `auto|cpu|gpu`）：
 
@@ -859,7 +1089,9 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
   "{base}/train"
 ```
 
-成功返回 `202` 和实际接受的参数。已经有训练在跑时返回 `409`。
+成功返回 `202` 和实际接受的参数。`accepted` 里是引擎**真正会用的**值：`device` 传了
+`auto` / `cpu` / `gpu` 之外的东西会被改成 `auto`，并出现在 `warnings` 数组里——
+不要拿你请求的值当真。已经有训练在跑时返回 `409`。
 
 3. 轮询进度。第一次拿到 `cursor`，之后每次把它带回去，只取增量：
 
@@ -875,6 +1107,8 @@ curl -s -H "Authorization: Bearer $TOKEN" "{base}/state?since=<上一步的 curs
 | `status` | `idle` / `running` / `done` / `failed` |
 | `epoch` / `total_epochs` | 进度 |
 | `last_loss` | 本轮平均损失，越低越好 |
+| `last_fitness` | 本轮验证适应度（检测看 mAP）。**判断模型好坏用这个，不是 loss**；`--no-val` 时为 null |
+| `last_epoch_seconds` | 上一轮耗时，乘剩余轮数就是剩余时间 |
 | `backend` | 实际用的后端：`cpu` 或 `gpu`（`auto` 可能回退到 `cpu`） |
 | `best` | 训练成功后导出的权重路径（`.bpk`），用于推理 |
 | `error` | 失败时为 `{{code, message, hint}}` |
@@ -898,6 +1132,15 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 文件写回图片旁边，也无法指向任意路径。这样推理不会污染下一次的数据集扫描。
 
 ## 事件流（`/events`）
+
+响应是 `{{"ok":true,"cursor":N,"reset":false,"truncated":false,"events":[...]}}`：
+
+- `cursor` — 下次把它当 `since` 传回来。**每次都用返回的值覆盖本地值**，
+  不要在 events 为空时保留旧值，否则应用重启后你可能永远收不到新事件。
+- `reset` — 为 true 说明你带的 cursor 来自上一个进程（`seq` 每次启动从 0 重新计）。
+  事件已经**从缓冲区开头重放**给你了，按「重新开始」处理即可。
+- `truncated` — 为 true 说明你漏掉了事件：缓冲区只留最近 400 条（引擎日志也算事件）。
+  收到就先读一遍 `/state` 的完整快照再继续。
 
 每个事件有 `type`：
 
@@ -1029,5 +1272,579 @@ mod tests {
         // Guards D022: Cargo.toml is frozen at 0.1.0 while tauri.conf.json is the source of truth.
         let _ = crate::version::VERSION;
         assert_eq!(crate::version::VERSION.split('.').count(), 3);
+    }
+
+    /* ─────────────── real HTTP, over a real listening socket ───────────────
+     *
+     * Everything above tests pure functions. None of it proves the service actually answers, and
+     * the interesting failures — auth ordering, 405 vs 404, a body the router never sees — only
+     * exist once a socket is involved.
+     */
+
+    struct Service {
+        runtime: Runtime,
+        handle: crate::control::Handle,
+        root: std::path::PathBuf,
+    }
+
+    impl Drop for Service {
+        fn drop(&mut self) {
+            self.handle.stop();
+            // `POST /train` tests do start a real engine child. Without this the test suite leaves
+            // a training process burning CPU after the assertions finish.
+            self.runtime.engine().kill_now();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A real service on an OS-assigned port, backed by a throwaway config directory.
+    fn service(tag: &str) -> Service {
+        let root = std::env::temp_dir().join(format!(
+            "yolo-control-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let runtime = Runtime::new(root.join("config"), root.join("data"));
+        let handle = super::start(runtime.clone(), 0).expect("service should bind");
+        Service {
+            runtime,
+            handle,
+            root,
+        }
+    }
+
+    struct Reply {
+        status: u16,
+        body: String,
+    }
+
+    impl Reply {
+        fn json(&self) -> Value {
+            serde_json::from_str(&self.body)
+                .unwrap_or_else(|error| panic!("not JSON ({error}): {}", self.body))
+        }
+    }
+
+    /// Send a raw request and read the reply **by `Content-Length`**, exactly as curl and reqwest
+    /// do. Reading to EOF instead looks equivalent and is not: Windows resets a loopback socket
+    /// when the server closes it while the kernel still holds unread bytes, so `read_to_end`
+    /// reports `ConnectionReset` on a reply it has already received in full.
+    ///
+    /// No proxy is involved: this connects directly, which is exactly what the service is for.
+    fn call(port: u16, head: &str, body: &[u8]) -> Reply {
+        use std::io::{BufRead as _, Read as _, Write as _};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut request = String::from(head);
+        request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        stream.write_all(request.as_bytes()).expect("write head");
+        stream.write_all(body).expect("write body");
+        stream.flush().ok();
+
+        let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).expect("status line");
+        let status = status_line
+            .split(' ')
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status in: {status_line:?}"));
+
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("header line") == 0 {
+                panic!("connection closed inside the headers");
+            }
+            if line == "\r\n" || line == "\n" {
+                break;
+            }
+            let lower = line.to_ascii_lowercase();
+            if let Some(rest) = lower.strip_prefix("content-length:") {
+                length = rest.trim().parse().expect("content-length");
+            }
+        }
+
+        let mut body = vec![0u8; length];
+        reader
+            .read_exact(&mut body)
+            .expect("body shorter than Content-Length");
+        Reply {
+            status,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }
+    }
+
+    fn get(port: u16, path: &str, token: Option<&str>) -> Reply {
+        let head = match token {
+            Some(token) => format!("GET {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n"),
+            None => format!("GET {path} HTTP/1.1\r\nHost: x\r\n"),
+        };
+        call(port, &head, b"")
+    }
+
+    fn post(port: u16, path: &str, token: &str, body: &str) -> Reply {
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
+             Content-Type: application/json\r\n"
+        );
+        call(port, &head, body.as_bytes())
+    }
+
+    /// One thread per connection means a client that retries in a tight loop can create threads
+    /// faster than they retire, and each one lives up to `IO_TIMEOUT`. The count must also come
+    /// back down: a leaked slot would leave the service refusing everything until the app
+    /// restarts, which is worse than the problem the limit solves.
+    #[test]
+    fn connection_limit_refuses_with_503_then_recovers() {
+        let service = service("conn-limit");
+        let port = service.handle.port;
+
+        // Hold every slot with connections that never send a request, so each handler parks in
+        // `read_request` instead of finishing immediately.
+        let mut hogs = Vec::new();
+        for _ in 0..super::MAX_CONNECTIONS {
+            hogs.push(std::net::TcpStream::connect(("127.0.0.1", port)).expect("hog connect"));
+        }
+        std::thread::sleep(Duration::from_millis(900));
+
+        let refused = get(port, "/health", Some(&service.handle.token));
+        assert_eq!(
+            refused.status, 503,
+            "over the limit must be a readable 503, not a dropped connection"
+        );
+        assert!(
+            !refused.json()["error"].as_str().unwrap_or("").is_empty(),
+            "a 503 without a reason leaves the caller guessing"
+        );
+
+        drop(hogs);
+        let mut recovered = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if get(port, "/health", Some(&service.handle.token)).status == 200 {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "the service must accept again after the hogs disconnect"
+        );
+    }
+
+    /// Percent-encode one query value. The fixture dataset lives under a path with Chinese
+    /// characters, and an unencoded `GET` is exactly the trap `POST /datasets/scan` exists to
+    /// avoid — so the end-to-end test has to hit both.
+    fn encode_query(text: &str) -> String {
+        let mut out = String::new();
+        for byte in text.as_bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    out.push(*byte as char)
+                }
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        out
+    }
+
+    /// The flow an assistant actually performs, over real HTTP against a real engine and a real
+    /// dataset — the same `control::start` the app runs, not a mock.
+    ///
+    /// `#[ignore]` because it trains: `cargo test --lib end_to_end -- --ignored --nocapture`.
+    /// Every assertion is observable from HTTP alone, which is the point — an AI client has
+    /// exactly this view and nothing more.
+    #[test]
+    #[ignore = "starts a real CPU training run"]
+    fn end_to_end_assistant_flow() {
+        let dataset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("spikes")
+            .join("tiny-dataset");
+        assert!(
+            dataset.join("dataset.yaml").is_file(),
+            "fixture dataset missing: {}",
+            dataset.display()
+        );
+        let dataset = dataset.to_string_lossy().into_owned();
+
+        let service = service("e2e");
+        let port = service.handle.port;
+        let token = service.handle.token.clone();
+
+        // Discovery: /health names the engine binary, so a caller learns whether it can train at
+        // all instead of finding out one request later.
+        let health = get(port, "/health", Some(&token));
+        assert_eq!(health.status, 200);
+        let engine = health.json()["engine"].as_str().unwrap_or("").to_owned();
+        assert!(
+            std::path::Path::new(&engine).is_file(),
+            "/health must point at a real engine: {engine}"
+        );
+
+        // Both scan entry points must agree. Two clients picking different ones cannot be allowed
+        // to see different numbers for the same directory.
+        let via_get = get(
+            port,
+            &format!("/datasets/scan?path={}", encode_query(&dataset)),
+            Some(&token),
+        );
+        assert_eq!(via_get.status, 200, "GET scan: {}", via_get.body);
+        let via_post = post(
+            port,
+            "/datasets/scan",
+            &token,
+            &json!({ "path": dataset }).to_string(),
+        );
+        assert_eq!(via_post.status, 200, "POST scan: {}", via_post.body);
+        let get_summary = via_get.json()["dataset"].clone();
+        let post_summary = via_post.json()["dataset"].clone();
+        assert_eq!(get_summary["train_images"], post_summary["train_images"]);
+        assert_eq!(get_summary["classes"], post_summary["classes"]);
+        assert!(
+            get_summary["train_images"].as_u64().unwrap_or(0) > 0,
+            "fixture dataset has no training images"
+        );
+
+        // A classification architecture on a YOLO dataset used to surface minutes later, from the
+        // engine. It must be refused before anything is spawned.
+        let mismatch = post(
+            port,
+            "/train",
+            &token,
+            &json!({
+                "init": { "mode": "scratch", "architecture": "yolo26n-cls" },
+                "dataset": dataset,
+                "epochs": 1,
+            })
+            .to_string(),
+        );
+        assert_eq!(mismatch.status, 400, "{}", mismatch.body);
+        assert!(
+            !mismatch.json()["error"].as_str().unwrap_or("").is_empty(),
+            "a 400 must say which side to change"
+        );
+
+        // Stopping when nothing runs must say so instead of pretending it stopped something.
+        let idle_stop = post(port, "/stop", &token, "{}");
+        assert_eq!(idle_stop.status, 200);
+        assert_eq!(idle_stop.json()["stopped"], false);
+
+        let accepted = post(
+            port,
+            "/train",
+            &token,
+            &json!({ "dataset": dataset, "epochs": 1, "batch": 2, "imgsz": 320, "device": "cpu" })
+                .to_string(),
+        );
+        assert_eq!(accepted.status, 202, "{}", accepted.body);
+
+        let mut cursor = 0u64;
+        let mut epoch_events = 0usize;
+        let mut final_state = Value::Null;
+        let deadline = Instant::now() + Duration::from_secs(420);
+        while Instant::now() < deadline {
+            let reply = get(port, &format!("/state?since={cursor}"), Some(&token));
+            assert_eq!(reply.status, 200);
+            let payload = reply.json();
+            cursor = payload["cursor"].as_u64().unwrap_or(cursor);
+            for event in payload["events"].as_array().cloned().unwrap_or_default() {
+                if event["type"] == "epoch" {
+                    epoch_events += 1;
+                }
+            }
+            final_state = payload["state"].clone();
+            if matches!(
+                final_state["status"].as_str().unwrap_or(""),
+                "done" | "failed"
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(700));
+        }
+
+        assert_eq!(final_state["status"], "done", "state: {final_state}");
+        assert_eq!(epoch_events, 1, "one epoch was requested");
+        // `fitness` is what a caller judges a model by; loss alone has been misleading on tiny
+        // datasets in this project before. Present-but-null is the correct answer for `--no-val`.
+        assert!(
+            final_state.get("last_fitness").is_some(),
+            "state must carry last_fitness: {final_state}"
+        );
+
+        let best = final_state["best"].as_str().unwrap_or("").to_owned();
+        assert!(
+            std::path::Path::new(&best).is_file(),
+            "best artifact missing: {best}"
+        );
+
+        // /runs must find, from disk, the run that just finished — this is the endpoint that
+        // survives an app restart, where /state forgets everything.
+        let runs = get(port, "/runs", Some(&token));
+        assert_eq!(runs.status, 200);
+        let list = runs.json()["runs"].as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            list.len(),
+            1,
+            "the throwaway output dir holds exactly the run under test: {}",
+            runs.body
+        );
+        let this_run = &list[0];
+        assert_eq!(this_run["epochs_completed"], 1);
+        assert_eq!(this_run["resumable"], true);
+        assert!(
+            this_run["classes"]
+                .as_array()
+                .is_some_and(|classes| !classes.is_empty()),
+            "classes must come from the run's own config: {this_run}"
+        );
+        // The two endpoints spell the same artifact differently — the engine hands `/state` a
+        // forward-slash path and `runs.rs` joins with the platform separator — so compare what the
+        // filesystem resolves rather than the strings. A caller that string-matches would be
+        // wrong; this asserts they are the same file.
+        let runs_best = this_run["best"].as_str().unwrap_or("");
+        assert_eq!(
+            std::fs::canonicalize(runs_best).ok(),
+            std::fs::canonicalize(&best).ok(),
+            "/runs and /state must point at the same artifact ({runs_best} vs {best})"
+        );
+
+        // Inference with the artifact this run produced.
+        let val_dir = std::path::Path::new(&dataset).join("images").join("val");
+        let image = std::fs::read_dir(&val_dir)
+            .expect("val images")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jpg"))
+            .expect("a validation image");
+        let predicted = post(
+            port,
+            "/predict",
+            &token,
+            &json!({ "model": best, "source": image.to_string_lossy() }).to_string(),
+        );
+        assert_eq!(predicted.status, 200, "{}", predicted.body);
+        assert!(
+            predicted.json()["result"]["prediction"].is_object(),
+            "the engine document is passed through unchanged: {}",
+            predicted.body
+        );
+    }
+
+    #[test]
+    fn the_document_is_readable_without_a_token_but_nothing_else_is() {
+        let service = service("auth");
+        let port = service.handle.port;
+
+        let guide = get(port, "/", None);
+        assert_eq!(guide.status, 200);
+        assert!(guide.body.contains("/runs"), "the document must list the new endpoint");
+
+        assert_eq!(get(port, "/health", None).status, 401);
+        assert_eq!(get(port, "/state", None).status, 401);
+        assert_eq!(get(port, "/health", Some("wrong")).status, 401);
+
+        let health = get(port, "/health", Some(&service.handle.token));
+        assert_eq!(health.status, 200);
+        assert_eq!(health.json()["ok"], true);
+    }
+
+    /// A known path with the wrong method is 405; an unknown one is 404. An AI probing the API
+    /// reads these as different answers.
+    #[test]
+    fn method_and_path_errors_are_distinguished() {
+        let service = service("routes");
+        let port = service.handle.port;
+        let token = service.handle.token.clone();
+
+        assert_eq!(get(port, "/nope", Some(&token)).status, 404);
+        assert_eq!(get(port, "/train", Some(&token)).status, 405);
+        assert_eq!(post(port, "/runs", &token, "").status, 405);
+        assert_eq!(post(port, "/datasets/scan", &token, "not json").status, 400);
+    }
+
+    /// Both scan entry points must answer the same thing. The GET one needs percent-encoding;
+    /// the POST one does not, which is the whole point of adding it.
+    #[test]
+    fn both_scan_entry_points_agree() {
+        let service = service("scan");
+        let port = service.handle.port;
+        let token = service.handle.token.clone();
+        let dataset = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("spikes")
+            .join("tiny-dataset");
+        assert!(dataset.is_dir(), "fixture missing: {}", dataset.display());
+        let as_forward = dataset.to_string_lossy().replace('\\', "/");
+
+        let encoded: String = as_forward
+            .bytes()
+            .map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'.' | b'-' | b'_') {
+                    (byte as char).to_string()
+                } else {
+                    format!("%{byte:02X}")
+                }
+            })
+            .collect();
+        let via_get = get(port, &format!("/datasets/scan?path={encoded}"), Some(&token));
+        assert_eq!(via_get.status, 200, "{}", via_get.body);
+        assert_eq!(via_get.json()["dataset"]["format"], "yolo");
+
+        let body = serde_json::json!({ "path": as_forward }).to_string();
+        let via_post = post(port, "/datasets/scan", &token, &body);
+        assert_eq!(via_post.status, 200, "{}", via_post.body);
+        assert_eq!(
+            via_get.json()["dataset"], via_post.json()["dataset"],
+            "the two entry points must not disagree"
+        );
+    }
+
+    /// After a restart the counter starts at 0 while the client still holds an old cursor. The
+    /// service has to replay instead of answering "nothing new" forever.
+    #[test]
+    fn a_stale_cursor_after_restart_is_flagged_not_silently_empty() {
+        let service = service("cursor");
+        let port = service.handle.port;
+        let token = service.handle.token.clone();
+
+        let reply = get(port, "/events?since=999999", Some(&token));
+        assert_eq!(reply.status, 200);
+        let body = reply.json();
+        assert_eq!(body["reset"], true);
+        assert_eq!(body["truncated"], false);
+        assert_eq!(body["cursor"], 0);
+
+        // A normal poll is not flagged.
+        let normal = get(port, "/state?since=0", Some(&token)).json();
+        assert_eq!(normal["reset"], false);
+        assert!(normal.get("state").is_some());
+    }
+
+    /// Every run the app ever produced, from disk. This is the whole reason `/runs` exists: after
+    /// a restart `/state` has no `best`, and without this an assistant cannot find the model.
+    #[test]
+    fn runs_reads_what_is_actually_on_disk() {
+        let service = service("runs");
+        let port = service.handle.port;
+        let token = service.handle.token.clone();
+
+        let empty = get(port, "/runs", Some(&token));
+        assert_eq!(empty.status, 200);
+        assert_eq!(empty.json()["count"], 0, "a fresh install has no runs");
+
+        let run = service.root.join("data").join("runs").join("detect").join("train-7");
+        std::fs::create_dir_all(run.join("exports")).unwrap();
+        std::fs::write(
+            run.join("results.csv"),
+            "epoch,train/loss,fitness\n1,2.5,\n2,1.5,0.31\n",
+        )
+        .unwrap();
+        std::fs::write(run.join("exports").join("best.bpk"), b"w").unwrap();
+
+        let body = get(port, "/runs", Some(&token)).json();
+        assert_eq!(body["count"], 1, "{}", body);
+        let first = &body["runs"][0];
+        assert_eq!(first["name"], "train-7");
+        assert_eq!(first["task"], "detect");
+        assert_eq!(first["epochs_completed"], 2);
+        assert_eq!(first["final_loss"], 1.5);
+        assert_eq!(first["final_fitness"], 0.31);
+        assert!(first["best"].as_str().unwrap().ends_with("best.bpk"));
+        assert_eq!(first["resumable"], false, "no checkpoints/last was written");
+    }
+
+    /// `stopped: true` when nothing was running is a lie an assistant waits on forever.
+    #[test]
+    fn stopping_nothing_says_so() {
+        let service = service("stop");
+        let reply = post(
+            service.handle.port,
+            "/stop",
+            &service.handle.token.clone(),
+            "",
+        );
+        assert_eq!(reply.status, 200);
+        let body = reply.json();
+        assert_eq!(body["stopped"], false);
+        assert!(body["note"].as_str().unwrap().contains("没有"));
+    }
+
+    /// The window command and the HTTP route must agree on what a device string means, because
+    /// `/train` echoes the normalised value and the caller acts on it.
+    #[test]
+    fn train_echoes_the_device_the_engine_will_actually_use() {
+        let service = service("device");
+        let dataset = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("spikes")
+            .join("tiny-dataset");
+        let body = serde_json::json!({
+            "architecture": "yolo26n",
+            "dataset": dataset.to_string_lossy(),
+            "epochs": 1,
+            "batch": 2,
+            "device": "tpu",
+        })
+        .to_string();
+        let reply = post(
+            service.handle.port,
+            "/train",
+            &service.handle.token.clone(),
+            &body,
+        );
+        // The engine may or may not be resolvable in this checkout; what matters is that a
+        // rejection is not a 400 about the device and that an accepted request reports `auto`.
+        if reply.status == 202 {
+            let accepted = reply.json();
+            assert_eq!(accepted["accepted"]["device"], "auto");
+            assert!(
+                accepted["warnings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|warning| warning.as_str().unwrap().contains("auto")),
+                "the rewrite must be explained: {accepted}"
+            );
+            let _ = service.runtime.stop_training();
+        } else {
+            assert_ne!(reply.status, 400, "device must never be a 400: {}", reply.body);
+        }
+    }
+
+    /// A classification architecture on a YOLO dataset is rejected before anything is spawned.
+    #[test]
+    fn a_task_dataset_mismatch_is_a_400_with_advice() {
+        let service = service("mismatch");
+        let dataset = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("spikes")
+            .join("tiny-dataset");
+        let body = serde_json::json!({
+            "architecture": "yolo26n-cls",
+            "dataset": dataset.to_string_lossy(),
+            "epochs": 1,
+        })
+        .to_string();
+        let reply = post(
+            service.handle.port,
+            "/train",
+            &service.handle.token.clone(),
+            &body,
+        );
+        assert_eq!(reply.status, 400, "{}", reply.body);
+        let message = reply.json()["error"].as_str().unwrap().to_owned();
+        assert!(message.contains("分类"), "must say what is wrong: {message}");
+        assert!(
+            message.contains("yolo26n-cls"),
+            "must name the fix: {message}"
+        );
     }
 }

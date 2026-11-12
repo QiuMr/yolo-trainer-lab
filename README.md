@@ -13,26 +13,78 @@
 | 能力 | 范围 |
 | --- | --- |
 | 任务 | 目标检测、实例分割、图像分类 |
-| 模型 | 7 个家族 × 规模档，共 **63 个可训练模型**（另有 10 个 ID 只能推理） |
+| 模型 | YOLO26 / YOLO11 / YOLOv8 × 三种任务 × n/s/m/l/x，共 **45 个** |
+| 预训练 | COCO（检测/分割）与 ImageNet（分类）权重，首次使用时从 GitHub 下载并校验 sha256 |
 | 数据集 | YOLO `dataset.yaml` + `images/`/`labels/`；ImageNet 风格 `train/<类名>/`（分类） |
 | 设备 | 自动探测显卡，失败/强制时回退 CPU；CPU 是正式支持的路径 |
 | 产物 | `exports/best.bpk`、`exports/last.bpk`、`results.csv`、验证指标 |
 | 验证 | 训练完选一张图直接推理，看标注图与检出列表 |
 | 自动更新 | GitHub Releases + minisign 签名校验 + NSIS 静默升级 |
-| AI 操控 | 本地 HTTP 服务（`127.0.0.1:47821`），带令牌，接口契约见 `docs/API.md` |
+| AI 操控 | 本地 HTTP 服务（`127.0.0.1:47821`），带令牌，见下文「用 AI 操控」 |
 
-模型选择器把 63 个模型拆成「任务 → 家族 → 规模」三层，不需要背模型 ID。
+模型选择器把 45 个模型拆成「任务 → 家族 → 规模」三层，不需要背模型 ID。
 
 ## 安装与使用
 
 从 [Releases](https://github.com/QiuMr/yolo-trainer-lab/releases/latest) 下载 `..._x64-setup.exe`，双击安装即可。装好后：
 
 1. **数据集**页选择目录 → 自动扫描类别、图片数、标注覆盖率（分类数据集会显示各类分布）。
-2. **训练**页选任务/家族/规模，设置轮数、batch、分辨率、设备 → 开始训练。
-3. **监控**页看 loss 曲线与日志；结束后用「验证模型」跑一张图。
+2. **训练**页选任务/家族/规模。**「从哪开始」优先选「用预训练权重」**：同一份小数据集上实测，从零训练 mAP 0.013%，COCO 预训练微调 3.22%，差 251 倍。权重首次使用时会自动下载（n 档约 5 MB），之后留在本地。再设置轮数、batch、分辨率、设备 → 开始训练。
+3. **监控**页看 loss 和 **mAP（fitness）** 曲线与日志。**只看 loss 会被骗**：本项目在极小数据集上真实出现过 loss 一路降、mAP 始终为 0 的训练。结束后用「验证模型」跑一张图。
 4. **设置**页可换引擎、改设备、开关 AI 服务、检查更新。
 
 关掉窗口不会退出程序（缩到托盘），从托盘菜单退出。
+
+## 用 AI 操控
+
+应用里跑着一个只监听本机的 HTTP 服务，AI 客户端（或任何脚本）可以用它扫描数据集、开始训练、读进度、拿产物、跑推理——和界面用的是同一份状态，不会出现界面显示第 7 轮、接口说是第 3 轮这种情况。
+
+**开关与端口**在「设置」页。默认 `http://127.0.0.1:47821`，端口设成 `0` 则由系统分配（设置页会显示实际值）。
+
+**令牌**是启动时生成并持久化的，路径固定：
+
+```
+%APPDATA%\com.yolotrainer.desktop\control-token
+```
+
+令牌不轮换——换了会让用户已经贴进对话里的提示词全部失效。
+
+最短的一次完整流程（PowerShell，可直接粘贴）：
+
+```powershell
+$token = (Get-Content "$env:APPDATA\com.yolotrainer.desktop\control-token" -Raw).Trim()
+$base  = "http://127.0.0.1:47821"
+$auth  = @{ Authorization = "Bearer $token" }
+$json  = "application/json"
+
+# 1. 服务活着吗？它会告诉你用的是哪个引擎
+Invoke-RestMethod "$base/health" -Headers $auth
+
+# 2. 这个数据集能用吗？（类别、图片数、缺标注的张数）
+Invoke-RestMethod "$base/datasets/scan" -Method Post -Headers $auth -ContentType $json `
+  -Body (@{ path = "E:\data\coco-mini" } | ConvertTo-Json)
+
+# 3. 开始训练。省略 init 就是从零训练
+Invoke-RestMethod "$base/train" -Method Post -Headers $auth -ContentType $json `
+  -Body (@{ dataset = "E:\data\coco-mini"; epochs = 50; batch = 8; device = "auto" } | ConvertTo-Json)
+
+# 4. 轮询进度：把上次响应里的 cursor 填进 since
+Invoke-RestMethod "$base/state?since=0" -Headers $auth
+
+# 5. 历史运行与产物（应用重启后 /state 会清空，只有这里还记着）
+Invoke-RestMethod "$base/runs" -Headers $auth
+
+# 6. 用刚训好的权重推理一张图
+Invoke-RestMethod "$base/predict" -Method Post -Headers $auth -ContentType $json `
+  -Body (@{ model = "…\exports\best.bpk"; source = "E:\data\a.jpg" } | ConvertTo-Json)
+```
+
+**给 AI 用的时候**：把 `http://127.0.0.1:47821/` 这个地址和令牌一起交出去就行。这个地址不需要令牌，返回的是一份自描述文档——端点清单、字段含义、典型流程都在里面，AI 读完能自己拼请求。更完整的契约在 `docs/API.md`。
+
+两个实际踩过的坑：
+
+- **本机代理**。开着系统代理时 `127.0.0.1` 可能被转发出去，报出来的错误看着像「服务没启动」。把回环地址加进代理例外。
+- **轮询要退避**。接口在并发连接超限时返回 `503`（上限 64），照着 `Retry-After` 的语义退避即可，不要空转重试。
 
 ## 从源码构建
 
@@ -122,10 +174,12 @@ montgomery.exe (AGPL-3.0, 独立进程)
 ## 已知边界
 
 - 本机核显（Vega 6）上 GPU 后端不可靠，**GPU 训练尚未在独显机器上验证**；CPU 全链路已实测通过。
-- 不能直接读 Ultralytics 的 `.pt`；从零训练是零配置的，用官方预训练权重需要 Python 侧转换。
+- 不能直接读 Ultralytics 的 `.pt`：社区权重需要先在 Python 侧转成 `.bpk`。内置的 COCO / ImageNet 预训练权重不用转换，首次使用时自动下载。
+- **n 档端到端验证完整**（训练 → 导出 → 推理）；m 档验证过导出结果与 ONNX Runtime 逐位一致；l/x 档只做形状校验，没有逐个跑完。
 - COCO JSON 数据集引擎支持，但扫描器未接入，界面里不能用。
 - 分割与检测共用 `*.txt` 标签，扫描器不解析内容，格式不匹配由引擎报错提示。
 - 无 AMP/FP16、无多卡，长程大规模训练不是这个引擎的赛道。
+- AI 服务只监听 `127.0.0.1`，不接受局域网连接（令牌是防止本机其他程序误用，不是网络鉴权）。
 
 ## 文档索引
 

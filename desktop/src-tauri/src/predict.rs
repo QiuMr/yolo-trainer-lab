@@ -50,6 +50,27 @@ pub struct PredictResult {
     pub prediction: serde_json::Value,
 }
 
+/// Why a prediction failed, split by whose fault it is.
+///
+/// The HTTP layer maps these to `400` and `500`. Reporting both as `400` made a crashed engine
+/// look like a malformed request, which is the most expensive kind of wrong answer for an AI
+/// client: it retries with different parameters instead of telling the user the model is broken.
+#[derive(Debug, Clone)]
+pub enum PredictError {
+    /// The caller's input: the image is missing, the confidence is out of range.
+    BadRequest(String),
+    /// Our side: the engine would not start, or answered with something unusable.
+    Internal(String),
+}
+
+impl PredictError {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::BadRequest(message) | Self::Internal(message) => message,
+        }
+    }
+}
+
 /// Pull the first complete JSON value out of a stream that also carries human text.
 fn extract_json(stdout: &str) -> Option<serde_json::Value> {
     for (index, _) in stdout.match_indices('{') {
@@ -103,17 +124,21 @@ pub fn run(
     request: &PredictRequest,
     model: &Path,
     default_dir: &Path,
-) -> Result<PredictResult, String> {
+) -> Result<PredictResult, PredictError> {
     let source = PathBuf::from(request.source.trim());
     if !source.is_file() {
-        return Err(format!("图片不存在：{}", source.display()));
+        return Err(PredictError::BadRequest(format!(
+            "图片不存在：{}",
+            source.display()
+        )));
     }
 
     // Never use `request.output`. A deterministic filename also caused a second bug: a leftover
     // file from an earlier run made `output.is_file()` report an image this run never wrote, so a
     // classification result could display a stale detection picture.
-    std::fs::create_dir_all(default_dir)
-        .map_err(|error| format!("创建输出目录失败：{error}"))?;
+    std::fs::create_dir_all(default_dir).map_err(|error| {
+        PredictError::Internal(format!("创建输出目录失败：{error}"))
+    })?;
     let output = unique_output_path(default_dir, &source);
 
     let mut command = hidden_command(engine);
@@ -133,7 +158,9 @@ pub fn run(
         .stdin(Stdio::null());
     if let Some(confidence) = request.confidence {
         if !(0.0..=1.0).contains(&confidence) {
-            return Err("confidence 必须在 0 到 1 之间。".into());
+            return Err(PredictError::BadRequest(
+                "confidence 必须在 0 到 1 之间。".into(),
+            ));
         }
         command.arg("--confidence").arg(confidence.to_string());
     }
@@ -143,7 +170,7 @@ pub fn run(
 
     let result = command
         .output()
-        .map_err(|error| format!("推理进程启动失败：{error}"))?;
+        .map_err(|error| PredictError::Internal(format!("推理进程启动失败：{error}")))?;
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
 
@@ -154,12 +181,14 @@ pub fn run(
         } else {
             detail
         };
-        return Err(format!("推理失败：{detail}"));
+        // The source image and the model were both verified to exist above, so a non-zero exit is
+        // the engine refusing to run — not a caller mistake to retry with other arguments.
+        return Err(PredictError::Internal(format!("推理失败：{detail}")));
     }
 
     let prediction = extract_json(&stdout).ok_or_else(|| {
         let tail = stdout.lines().rev().take(4).collect::<Vec<_>>().join(" / ");
-        format!("推理没有返回 JSON：{tail}")
+        PredictError::Internal(format!("推理没有返回 JSON：{tail}"))
     })?;
 
     // The engine writes no image for classification, so reporting a path there would be a lie.

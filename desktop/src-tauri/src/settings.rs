@@ -14,6 +14,24 @@ use serde::{Deserialize, Serialize};
 /// Values `--device` accepts. Kept in sync with montgomery's `DeviceSelection`.
 pub const DEVICES: [&str; 3] = ["auto", "cpu", "gpu"];
 
+/// Coerce a requested device into one `--device` accepts, falling back when it is blank.
+///
+/// This is the **single source** of the rule. Both the engine spawn path and the HTTP control
+/// service call it: when the control service had its own copy, `POST /train` echoed the requested
+/// string while the engine ran something else, so an AI that asked for `gpu` and silently got
+/// `auto` had no way to notice.
+pub fn normalize_device(requested: &str, fallback: &str) -> String {
+    let requested = requested.trim();
+    if requested.is_empty() {
+        return normalize_device(fallback, "auto");
+    }
+    if DEVICES.contains(&requested) {
+        return requested.to_owned();
+    }
+    "auto".to_owned()
+}
+
+
 /// Default port for the local control service. Chosen from the dynamic range and far away from
 /// the well-known ports a developer machine is likely to have occupied (3000, 5000, 8080).
 pub const DEFAULT_CONTROL_PORT: u16 = 47821;
