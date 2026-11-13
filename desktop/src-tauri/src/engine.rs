@@ -9,11 +9,96 @@
 //! verbatim; the shell only ever *adds* the `exit` event, because a process cannot report its own
 //! exit code.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+
+/// One rollover point. Engine stderr is a few hundred lines per run, so 8 MiB holds many runs;
+/// the number is only here so a pathological run cannot fill the disk.
+const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Append-only engine log.
+///
+/// Why this exists: stderr used to be forwarded to the in-memory hub and nowhere else, so the only
+/// record of a GPU `device lost`, a panic, or an ONNX shape error lived in the window's log panel.
+/// Close the window — or let the app restart — and the evidence was gone. A user reporting "it just
+/// failed" could not be helped, because nothing had been written down.
+///
+/// Every line is flushed immediately. Buffering would be faster, but a crash is precisely the case
+/// where the last few lines matter most, and those are the ones a buffer would lose.
+pub(crate) struct LogFile {
+    path: PathBuf,
+    state: Mutex<(Option<std::fs::File>, u64)>,
+}
+
+impl LogFile {
+    pub fn new(path: PathBuf) -> Self {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        Self {
+            path,
+            state: Mutex::new((None, 0)),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn write(&self, line: &str) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state.0.is_none() {
+            let existing = std::fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0);
+            if existing > MAX_LOG_BYTES {
+                // One generation is kept: a crash shortly after rollover still has the previous
+                // file next to it.
+                let rotated = self.path.with_extension("log.1");
+                let _ = std::fs::rename(&self.path, &rotated);
+                state.1 = 0;
+            } else {
+                state.1 = existing;
+            }
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+            {
+                Ok(file) => state.0 = Some(file),
+                // A log that cannot be opened must not stop training. The run is the product; the
+                // log is diagnostics.
+                Err(_) => return,
+            }
+        }
+        let Some(file) = state.0.as_mut() else {
+            return;
+        };
+        let stamp = stamp_now();
+        let _ = writeln!(file, "{stamp} {line}");
+        let _ = file.flush();
+        state.1 += line.len() as u64 + stamp.len() as u64 + 2;
+        if state.1 > MAX_LOG_BYTES {
+            // Roll on the next write rather than here, so the caller never sees a half-written file.
+            state.0 = None;
+        }
+    }
+}
+
+/// `HH:MM:SS.mmm` in local time is not available without a time crate; UTC seconds since the
+/// Unix epoch plus a monotonic-ish counter is enough to order lines, and the report header carries
+/// the human-readable date.
+fn stamp_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    format!("{millis}")
+}
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -268,6 +353,20 @@ impl Hub {
 struct Inner {
     child: Mutex<Option<Child>>,
     hub: Hub,
+    /// `None` in unit tests: they assert on the hub, and a file would only make them order-
+    /// dependent on the filesystem.
+    log: Option<Arc<LogFile>>,
+}
+
+impl Inner {
+    /// Publish a human line *and* persist it. Every path that produces [`Message::Log`] goes
+    /// through here, otherwise the file would silently miss exactly the lines a crash produces.
+    fn note(&self, line: String) {
+        if let Some(log) = &self.log {
+            log.write(&line);
+        }
+        self.hub.publish(Message::Log(line));
+    }
 }
 
 /// Handle to the engine process. Cheap to clone; all clones share one child and one hub.
@@ -279,11 +378,26 @@ impl Default for Engine {
         Self(Arc::new(Inner {
             child: Mutex::new(None),
             hub: Hub::default(),
+            log: None,
         }))
     }
 }
 
 impl Engine {
+    /// Same as [`Default`], but every human line is also appended to `<dir>/engine.log`.
+    /// The app uses this; tests use `default()`.
+    pub fn with_log_dir(dir: impl AsRef<Path>) -> Self {
+        Self(Arc::new(Inner {
+            child: Mutex::new(None),
+            hub: Hub::default(),
+            log: Some(Arc::new(LogFile::new(dir.as_ref().join("engine.log")))),
+        }))
+    }
+
+    pub fn log_path(&self) -> Option<PathBuf> {
+        self.0.log.as_ref().map(|log| log.path().to_path_buf())
+    }
+
     pub fn subscribe(&self) -> mpsc::Receiver<Message> {
         self.0.hub.subscribe()
     }
@@ -365,12 +479,12 @@ impl Engine {
                 // Surface what is being continued. The UI cannot read the checkpoint itself, and an
                 // assistant watching the log should see which dataset is about to be walked and how
                 // many epochs it is signing up for.
-                self.0.hub.publish(Message::Log(format!(
+                self.0.note(format!(
                     "续训：从 {} 恢复 · 数据集 {} · 计划 {} 轮",
                     info.dir.display(),
                     info.dataset,
                     info.epochs
-                )));
+                ));
             }
         }
         command
@@ -413,7 +527,7 @@ impl Engine {
                         Ok(value) => engine.0.hub.publish(Message::Event(value)),
                         // Not an event: keep it visible rather than silently dropping it. A
                         // panic line arrives this way and is the only clue when a run dies.
-                        Err(_) => engine.0.hub.publish(Message::Log(trimmed.to_owned())),
+                        Err(_) => engine.0.note(trimmed.to_owned()),
                     }
                 }
             });
@@ -424,7 +538,7 @@ impl Engine {
             std::thread::spawn(move || {
                 for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                     if !line.trim().is_empty() {
-                        engine.0.hub.publish(Message::Log(line));
+                        engine.0.note(line);
                     }
                 }
             });
@@ -490,6 +604,34 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A crash must not lose the lines just before it, which is why every write flushes.
+    #[test]
+    fn the_log_file_appends_flushes_and_keeps_a_path() {
+        let dir = std::env::temp_dir().join(format!("yt-logfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let log = LogFile::new(dir.join("engine.log"));
+        log.write("first line");
+        log.write("second line");
+        let text = std::fs::read_to_string(log.path()).expect("log file must exist");
+        assert!(text.contains("first line"), "{text}");
+        assert!(text.contains("second line"), "{text}");
+        assert_eq!(text.lines().count(), 2, "one write must be one line");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file is not an afterthought to the hub: the same call that publishes a line persists it.
+    #[test]
+    fn an_engine_with_a_log_dir_persists_the_human_lines_it_publishes() {
+        let dir = std::env::temp_dir().join(format!("yt-enginelog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let engine = Engine::with_log_dir(&dir);
+        engine.0.note("device lost on adapter Vega 6".into());
+        let path = engine.log_path().expect("a log dir was given");
+        let text = std::fs::read_to_string(path).expect("file written");
+        assert!(text.contains("device lost on adapter Vega 6"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn request(device: &str) -> TrainRequest {
         TrainRequest {

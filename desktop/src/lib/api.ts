@@ -89,6 +89,10 @@ export type Settings = {
   control_enabled: boolean;
   /** `0` asks the OS for a free port; the actual one comes back in `SettingsView.control`. */
   control_port: number;
+  /** `wecom` | `pushplus` | `generic`. Where a failure summary is pushed. */
+  feedback_kind: string;
+  /** Empty means reports are written locally and never leave the machine. */
+  feedback_webhook: string;
 };
 
 /**
@@ -125,6 +129,11 @@ export type SettingsView = {
   config_dir: string;
   engine_running: boolean;
   control: ControlInfo;
+  /** Where a failure summary is pushed; empty means "local report only". */
+  feedback_kind: string;
+  feedback_webhook: string;
+  /** Folder holding the local reports, so the UI can show where they are. */
+  diagnostics_dir: string;
 };
 
 const SAMPLE_SETTINGS: SettingsView = {
@@ -144,6 +153,9 @@ const SAMPLE_SETTINGS: SettingsView = {
     base_url: "http://127.0.0.1:47821",
     error: null,
   },
+  feedback_kind: "wecom",
+  feedback_webhook: "",
+  diagnostics_dir: "C:\\Users\\you\\AppData\\Roaming\\com.yolotrainer.desktop\\diagnostics",
 };
 
 const SAMPLE_DATASET: DatasetSummary = {
@@ -340,6 +352,17 @@ export async function getSettings(): Promise<SettingsView> {
   return await invoke<SettingsView>("get_settings");
 }
 
+/**
+ * Open the folder holding the local failure reports.
+ *
+ * The shell creates it first: a build that has never failed has no `diagnostics/` directory, and
+ * asking Windows to open a path that does not exist shows an error instead of an empty folder.
+ */
+export async function openDiagnosticsFolder(): Promise<void> {
+  if (!isTauri) return;
+  await invoke("open_diagnostics_folder");
+}
+
 /** Returns the stored settings as the shell sees them, so the UI can show what actually landed. */
 export async function saveSettings(
   settings: Settings,
@@ -354,6 +377,8 @@ export async function saveSettings(
       output_dir_is_default: settings.output_dir === null,
       // Preview has no listener, so the toggle only has to change what is rendered.
       control: { ...SAMPLE_SETTINGS.control, enabled: settings.control_enabled },
+      feedback_kind: settings.feedback_kind,
+      feedback_webhook: settings.feedback_webhook,
     };
   }
   return await invoke<SettingsView>("save_settings", { settings });

@@ -1,5 +1,33 @@
 # 变更记录
 
+## 2026-11-13 · 失败自动留诊断；引擎 stderr 落盘；失败摘要推到手机
+
+起因是用户提出「用户没地方反馈 bug，AI 遇到问题应该能精准反馈，收不到就太可惜了」。
+实现时把重点从「加反馈入口」改成「让失败本身留下证据」——此前引擎 stderr 只进内存 hub，
+窗口一关就永久消失，用户只能说「它失败了」。决策与被否决方案见 D032。
+
+- **引擎日志落盘（前提）**：stderr 与所有人类可读输出同时写
+  `%APPDATA%\...\logs\engine.log`，每行立即 flush，8 MiB 滚动保留一代。此前崩溃无痕。
+- **失败自动生成报告（新）**：`POST /train` 启动失败、`POST /predict` 失败、训练中途
+  以 `failed` 收尾，三条路径由服务端直接写 `diagnostics/<时间>-<code>.md`，并把
+  `diagnostics{id,path,pushed}` 放进那条错误响应。**助手不需要做任何额外动作**。
+- **错误响应结构化**：新增 `code`（机器可读）与 `hint`（给人看的下一步）。此前
+  `error` 只有一段人话，客户端无法区分「参数错」与「引擎崩了」。
+- **上报通道（新 `feedback.rs`）**：`wecom` / `pushplus` / `generic`，只发脱敏摘要
+  （版本 + 错误码 + 一句话现象 + 后端），不含路径与数据集名。每分钟最多 3 条。
+  通道配置内嵌在 `resources/feedback.json`，分发出去的包开箱可用，最终用户零配置。
+- **脱敏（`diagnostics::redact`）**：`%USERPROFILE%` → `<user>`，数据集路径 → `<dataset>`。
+  同时处理原始、JSON 转义（`\\`）、正斜杠三种写法——**第一版只处理单反斜杠，
+  真实报告里 `C:\\Users\\13114\\...` 原样漏出**，已修并有测试锁住。
+- **新增端点**：`GET /diagnostics?limit=N` 列出报告；`POST /diagnostics` 接受
+  `{summary, expected, context}`，用于「没报错但结果不对」的问题（mAP 恒 0 等）。
+- **设置页新增「问题上报」卡片**：显示是否外发、发什么、不含什么，并可打开报告目录。
+- **`SettingsView` 新增** `feedback_kind` / `feedback_webhook` / `diagnostics_dir`。
+
+测试：`cargo test --lib` **84 passed / 4 ignored**（改前 62）。端点级测试覆盖鉴权、
+报告落盘与内容、缺 `summary` 拒绝、以及「500 自动带报告」走真引擎失败路径。
+端到端 `end_to_end_assistant_flow` 增加引擎日志非空断言，3.6 秒全绿。
+
 ## 2026-11-13 · 修「AI 接口在无窗口进程里看不到进度」与三处资源/语义缺陷
 
 起因是给控制服务补真实端到端测试，第一次跑就暴露了三个问题。决策与被否决方案见 D031。

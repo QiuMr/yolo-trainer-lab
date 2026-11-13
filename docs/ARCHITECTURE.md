@@ -107,7 +107,9 @@ GPU 驱动出问题只会杀掉引擎进程，壳活着并可以提示或重试�
 | `settings.rs` | `settings.json` 读写与归一化（含控制服务的开关与端口） | 否 |
 | `runstate.rs` | 把 hub 事件折叠成一份快照（status/epoch/loss/fitness/产物/错误），并给出增量事件与 `reset`/`truncated` 标记 | 否 |
 | `runs.rs` | 扫 `runs/<task>/<run>/` 报告历史运行与可用产物（`/runs` 的实现；`/state` 重启即失忆，磁盘不会） | 否 |
-| `runtime.rs` | 两边共享的状态：设置、引擎句柄、快照、控制服务句柄。**折叠线程在 `new` 里启动**：hub 是扇出结构，快照在这里更新，窗口与 AI 客户端因此看到的永远是同一份进度，而不依赖 UI 层线程是否存活 | 否 |
+| `runtime.rs` | 两边共享的状态：设置、引擎句柄、快照、控制服务句柄。**折叠线程在 `new` 里启动**：hub 是扇出结构，快照在这里更新，窗口与 AI 客户端因此看到的永远是同一份进度，而不依赖 UI 层线程是否存活。也在这里生成诊断报告（`diagnose`） | 否 |
+| `diagnostics.rs` | 把一次失败写成可直接外发的 markdown：环境快照（版本/OS/核数/后端/引擎大小与 mtime）、脱敏（`<user>`/`<dataset>`，含 JSON 转义写法）、日志尾部 120 行 | 否 |
+| `feedback.rs` | 把脱敏摘要推到 `wecom` / `pushplus` / `generic`。每分钟最多 3 条，5 秒超时，失败静默 | 否 |
 | `control.rs` | 本地 HTTP 服务：路由、鉴权、自描述文档 | 否 |
 | `version.rs` | 版本号（`build.rs` 从 `tauri.conf.json` 注入）+ 数值化版本比较 | 否 |
 | `pretrained.rs` | 预训练权重清单（编译进二进制）、按需下载、sha256 校验、缓存到 `%LOCALAPPDATA%`、发进度事件 | 部分（只用到 `app_local_data_dir` 与事件） |

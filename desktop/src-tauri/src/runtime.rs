@@ -43,6 +43,12 @@ pub struct SettingsView {
     /// State of the AI-facing HTTP service, including the port it actually got — which is not
     /// necessarily the one that was asked for (see `control::start`).
     pub control: ControlInfo,
+    /// Where a failure summary is pushed (`wecom` | `pushplus` | `generic`).
+    pub feedback_kind: String,
+    /// Empty means reports are written locally and not sent anywhere.
+    pub feedback_webhook: String,
+    /// Where the local failure reports live. Shown so a user can find the file to send.
+    pub diagnostics_dir: String,
 }
 
 /// Live state of the control service. Written once at startup and again whenever the user toggles
@@ -66,29 +72,85 @@ struct Inner {
     config_dir: PathBuf,
     /// Where `runs/` goes when the user has not picked a folder.
     default_output_dir: PathBuf,
+    /// App data directory. `logs/` and `diagnostics/` live here, next to `runs/`.
+    data_dir: PathBuf,
     run: Mutex<RunState>,
     control: Mutex<ControlInfo>,
     /// The live service, when one is listening. Holding the handle is what makes the toggle
     /// immediate: `stop()` flips a flag the accept loop polls.
     control_handle: Mutex<Option<crate::control::Handle>>,
+    /// Dedupe key of the last mid-run failure that was written up. The engine emits an `error`
+    /// event and then an `exit` event, and both leave `status = failed`; without this a single
+    /// crash would file two reports and burn two of the three pushes allowed per minute.
+    reported_failure: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
 pub struct Runtime(Arc<Inner>);
+
+/// Write up a run that died, off the folding thread.
+///
+/// Runs on its own thread because `diagnose` may do a network call with a 5 s timeout, and the
+/// caller is the thread that folds every engine event — blocking it would stall the very progress
+/// reporting a user looking at a failed run is watching.
+fn report_failure(inner: &Arc<Inner>, run_dir: Option<String>, error: Option<Value>) {
+    let code = error
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("run_failed")
+        .to_owned();
+    {
+        let Ok(mut seen) = inner.reported_failure.lock() else {
+            return;
+        };
+        let key = format!("{}|{code}", run_dir.clone().unwrap_or_default());
+        if seen.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        *seen = Some(key);
+    }
+    let message = error
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("训练失败，引擎没有给出原因。")
+        .to_owned();
+    let hint = error
+        .as_ref()
+        .and_then(|value| value.get("hint"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let handle = Runtime(inner.clone());
+    std::thread::spawn(move || {
+        let draft = crate::diagnostics::Draft {
+            kind: "train_failed",
+            code: &code,
+            message: &message,
+            hint: hint.as_deref(),
+            context: serde_json::json!({ "run_dir": run_dir }),
+        };
+        let _ = handle.diagnose(&draft, None);
+    });
+}
 
 impl Runtime {
     pub fn new(config_dir: PathBuf, app_data_dir: PathBuf) -> Self {
         let store = settings::Store::new(config_dir.join("settings.json"));
         let current = store.load();
         let runtime = Self(Arc::new(Inner {
-            engine: Engine::default(),
+            // Logs live beside `runs/` so a user told "send me %APPDATA%\com.yolotrainer.desktop"
+            // finds both in one place.
+            engine: Engine::with_log_dir(app_data_dir.join("logs")),
             store,
             settings: Mutex::new(current),
             config_dir,
             default_output_dir: app_data_dir.join("runs"),
+            data_dir: app_data_dir,
             run: Mutex::new(RunState::default()),
             control: Mutex::new(ControlInfo::default()),
             control_handle: Mutex::new(None),
+            reported_failure: Mutex::new(None),
         }));
 
         // Fold engine messages here, not in the Tauri setup. The hub fans out to every subscriber
@@ -102,11 +164,26 @@ impl Runtime {
         let weak = Arc::downgrade(&runtime.0);
         let receiver = runtime.0.engine.subscribe();
         std::thread::spawn(move || {
+            let mut was_running = false;
             for message in receiver {
                 let Some(inner) = weak.upgrade() else { break };
-                if let Ok(mut run) = inner.run.lock() {
+                let (status, run_dir, error) = {
+                    let Ok(mut run) = inner.run.lock() else {
+                        continue;
+                    };
                     run.apply(&message);
+                    // Only the three fields the report needs: cloning the whole `RunState` here
+                    // would copy the event ring buffer on every single log line.
+                    (run.status.clone(), run.run_dir.clone(), run.error.clone())
+                };
+                // A run that dies mid-training is the case most worth a report: the user was
+                // watching it, and the `error` event that explains why flashes past in the log
+                // panel. Handled on a separate thread because writing the file and pushing the
+                // summary can take seconds, and this thread folds the event stream.
+                if status == "failed" && was_running {
+                    report_failure(&inner, run_dir, error);
                 }
+                was_running = status == "running";
             }
         });
 
@@ -155,6 +232,9 @@ impl Runtime {
             engine_running: self.0.engine.is_running(),
             control_port: current.control_port,
             control: self.control(),
+            feedback_kind: current.feedback_kind.clone(),
+            feedback_webhook: current.feedback_webhook.clone(),
+            diagnostics_dir: self.diagnostics_root().to_string_lossy().into_owned(),
         }
     }
 
@@ -313,6 +393,138 @@ impl Runtime {
             self.set_control(info);
         }
     }
+
+    /// Where failure reports are written.
+    pub fn diagnostics_root(&self) -> PathBuf {
+        self.0.data_dir.join("diagnostics")
+    }
+
+    /// Everything a maintainer needs to judge a report without asking a follow-up question.
+    ///
+    /// The engine's own size and mtime are the most valuable entries here: this project has more
+    /// than once "fixed" a bug in a patch while the packaged engine was still the old binary, and
+    /// that is invisible in every other field.
+    pub fn environment(&self) -> Value {
+        let current = self.settings();
+        let snapshot = self.run_snapshot();
+        let resolved = crate::engine::resolve(current.engine_path.as_deref()).ok();
+        let (engine_bytes, engine_modified) = resolved
+            .as_ref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|meta| {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|since| since.as_secs())
+                    .unwrap_or(0);
+                (meta.len(), modified)
+            })
+            .unwrap_or((0, 0));
+        serde_json::json!({
+            "version": crate::version::VERSION,
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "cores": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+            "backend": snapshot.get("adapter").cloned().unwrap_or(Value::Null),
+            "device_setting": current.default_device,
+            "status": snapshot.get("status").cloned().unwrap_or(Value::Null),
+            "epoch": snapshot.get("epoch").cloned().unwrap_or(Value::Null),
+            "total_epochs": snapshot.get("total_epochs").cloned().unwrap_or(Value::Null),
+            "engine": resolved.map(|path| path.to_string_lossy().into_owned()),
+            "engine_bytes": engine_bytes,
+            "engine_modified_unix": engine_modified,
+            "output_dir": self.output_root().to_string_lossy(),
+        })
+    }
+
+    /// Write a report for `draft`, then push its summary if a channel is configured.
+    ///
+    /// Returns `None` only when the report file itself could not be written. Every other problem —
+    /// no channel, dead webhook, rate limited — is reported through the returned struct, because
+    /// the caller is already handling a failure and must not be handed a second one.
+    pub fn diagnose(
+        &self,
+        draft: &crate::diagnostics::Draft<'_>,
+        dataset: Option<&str>,
+    ) -> Option<Diagnostic> {
+        let home = std::env::var("USERPROFILE").ok();
+        let tail = self
+            .0
+            .engine
+            .log_path()
+            .map(|path| crate::diagnostics::log_tail(&path, 120))
+            .unwrap_or_default();
+        let written = crate::diagnostics::write(
+            &self.diagnostics_root(),
+            draft,
+            &self.environment(),
+            &tail,
+            home.as_deref(),
+            dataset,
+        )
+        .ok()?;
+
+        let current = self.settings();
+        let mut pushed = false;
+        let mut push_error = None;
+        if !current.feedback_webhook.is_empty() {
+            let snapshot = self.run_snapshot();
+            let env_line = format!(
+                "{} {} · {} 核 · 后端 {}",
+                std::env::consts::OS,
+                std::env::consts::ARCH,
+                std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+                snapshot
+                    .get("adapter")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            );
+            let body = crate::feedback::compose(
+                crate::version::VERSION,
+                &written.created,
+                draft.code,
+                &written.summary,
+                &written.id,
+                &env_line,
+            );
+            let title = format!("YOLO Trainer {} {}", crate::version::VERSION, draft.code);
+            match crate::feedback::push(
+                &current.feedback_kind,
+                &current.feedback_webhook,
+                &title,
+                &body,
+                &written.id,
+            ) {
+                Ok(()) => {
+                    pushed = true;
+                    crate::diagnostics::mark_pushed(Path::new(&written.path));
+                }
+                Err(error) => push_error = Some(error),
+            }
+        }
+
+        Some(Diagnostic {
+            id: written.id,
+            path: written.path,
+            summary: written.summary,
+            pushed,
+            push_error,
+        })
+    }
+}
+
+/// What a caller gets back about a failure they just caused.
+#[derive(Debug, Clone, Serialize)]
+pub struct Diagnostic {
+    pub id: String,
+    /// Absolute path to the local report. Always present when this struct exists.
+    pub path: String,
+    pub summary: String,
+    /// True only when the summary actually reached the configured channel.
+    pub pushed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub push_error: Option<String>,
 }
 
 #[cfg(test)]

@@ -233,6 +233,29 @@ impl Response {
         Self::json(status, json!({ "ok": false, "error": message.into() }))
     }
 
+    /// A failure with a machine-readable `code`, an optional `hint`, and — for failures we decided
+    /// the maintainer should see — the diagnostics report just written for it.
+    ///
+    /// `code` exists because `error` used to be prose only. A client cannot branch on prose: it
+    /// cannot tell "your dataset path is wrong" from "the GPU driver died", so its only options
+    /// were to retry or to give up. Both are wrong for one of the two cases.
+    fn failure(
+        status: u16,
+        code: &str,
+        message: impl Into<String>,
+        hint: Option<&str>,
+        diagnostic: Option<&crate::runtime::Diagnostic>,
+    ) -> Self {
+        let mut body = json!({ "ok": false, "error": message.into(), "code": code });
+        if let Some(hint) = hint {
+            body["hint"] = json!(hint);
+        }
+        if let Some(diagnostic) = diagnostic {
+            body["diagnostics"] = serde_json::to_value(diagnostic).unwrap_or(Value::Null);
+        }
+        Self::json(status, body)
+    }
+
     fn reason(&self) -> &'static str {
         match self.status {
             200 => "OK",
@@ -643,6 +666,26 @@ fn route(request: &Request, runtime: &Runtime, started: Instant) -> Response {
                 }),
             )
         }
+        ("GET", "/diagnostics") => {
+            let limit = request
+                .query
+                .get("limit")
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(20);
+            let root = runtime.diagnostics_root();
+            let list = crate::diagnostics::list(&root, limit);
+            Response::json(
+                200,
+                json!({
+                    "ok": true,
+                    "root": root.to_string_lossy(),
+                    "count": list.len(),
+                    "note": "每份报告都在本地，路径与数据集名已脱敏。pushed=false 表示没推送到开发者的通道。",
+                    "reports": list,
+                }),
+            )
+        }
+        ("POST", "/diagnostics") => submit_diagnostic(request, runtime),
         ("POST", "/train") => start_training(request, runtime),
         ("POST", "/predict") => run_prediction(request, runtime),
         ("POST", "/stop") => {
@@ -713,6 +756,7 @@ fn route(request: &Request, runtime: &Runtime, started: Instant) -> Response {
                 "/stop",
                 "/predict",
                 "/datasets/scan",
+                "/diagnostics",
                 "/settings",
             ]
             .contains(&path) =>
@@ -885,7 +929,33 @@ fn start_training(request: &Request, runtime: &Runtime) -> Response {
         // The early is_running() check is a TOCTOU window; Engine::start is now atomic, so a
         // race shows up here as an error rather than a second orphan process. Report it as 409.
         Err(error) if error.contains("已有训练") => Response::error(409, error),
-        Err(error) => Response::error(500, error),
+        Err(error) => {
+            // A failed spawn is the most valuable thing to capture in this whole service: the
+            // engine's exit message is usually one line ("no compatible GPU adapter"), and the
+            // detail that explains it exists only in stderr — which used to be discarded.
+            let hint = "先看报告里的「引擎日志尾部」。如果写着 no compatible GPU adapter，把 device 改成 cpu 再试。";
+            let diagnostic = runtime.diagnose(
+                &crate::diagnostics::Draft {
+                    kind: "train_start_failed",
+                    code: "engine_spawn_failed",
+                    message: &error,
+                    hint: Some(hint),
+                    context: json!({
+                        "init": &train.init,
+                        "epochs": train.epochs,
+                        "batch": train.batch,
+                        "imgsz": train.imgsz,
+                        "device": &train.device,
+                    }),
+                },
+                if train.dataset.is_empty() {
+                    None
+                } else {
+                    Some(train.dataset.as_str())
+                },
+            );
+            Response::failure(500, "engine_spawn_failed", error, Some(hint), diagnostic.as_ref())
+        }
     }
 }
 
@@ -940,12 +1010,85 @@ fn run_prediction(request: &Request, runtime: &Runtime) -> Response {
         // as 400 sent clients into a parameter-tuning loop when the real problem was a model the
         // engine could not load.
         Err(crate::predict::PredictError::BadRequest(message)) => Response::error(400, message),
-        Err(crate::predict::PredictError::Internal(message)) => Response::error(500, message),
+        Err(crate::predict::PredictError::Internal(message)) => {
+            // Same reasoning as a failed spawn: "推理失败：exit code 1" with nothing else is
+            // unactionable, and the reason is in stderr.
+            let hint = "确认模型与模型架构一致。若报显存或 device lost，把 device 改成 cpu 再试。";
+            let diagnostic = runtime.diagnose(
+                &crate::diagnostics::Draft {
+                    kind: "predict_failed",
+                    code: "engine_predict_failed",
+                    message: &message,
+                    hint: Some(hint),
+                    context: json!({
+                        "model": model.display().to_string(),
+                        "source": parsed.source,
+                        "device": parsed.device,
+                        "masks": parsed.masks,
+                    }),
+                },
+                None,
+            );
+            Response::failure(500, "engine_predict_failed", message, Some(hint), diagnostic.as_ref())
+        }
     }
 }
 
-fn uint(value: &Value, key: &str) -> Option<u32> {
-    value
+/// `POST /diagnostics` — the client's own account of a problem.
+///
+/// The failures that never produce an error are the ones most likely to go unreported: mAP stuck
+/// at 0 for thirty epochs, a run that "succeeds" in two seconds, boxes all in one corner. Nothing
+/// throws, so nothing is captured. This is the only path that lets a client say "this ran, and the
+/// result is wrong".
+///
+/// The environment and the log tail are added here rather than accepted from the client: it cannot
+/// know the engine's mtime, and letting it supply them would let a wrong guess into the report.
+fn submit_diagnostic(request: &Request, runtime: &Runtime) -> Response {
+    let Ok(value) = serde_json::from_slice::<Value>(&request.body) else {
+        return Response::error(
+            400,
+            "body 不是有效 JSON。需要 {\"summary\":\"一句话现象\",\"context\":{…},\"expected\":\"预期是什么\"}。",
+        );
+    };
+    let Some(summary) = value
+        .get("summary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    else {
+        return Response::error(
+            400,
+            "缺少 summary。用一句话说清现象，例如「训练 30 轮后 mAP 一直是 0，loss 一直在降」。",
+        );
+    };
+    if summary.chars().count() > 2000 {
+        return Response::error(400, "summary 太长（上限 2000 字）。细节放 context。");
+    }
+    let context = value.get("context").cloned().unwrap_or(Value::Null);
+    let diagnostic = runtime.diagnose(
+        &crate::diagnostics::Draft {
+            kind: "assistant_report",
+            code: "assistant_report",
+            message: summary,
+            hint: value.get("expected").and_then(Value::as_str),
+            context,
+        },
+        None,
+    );
+    match diagnostic {
+        Some(report) => Response::json(
+            202,
+            json!({
+                "ok": true,
+                "report": report,
+                "note": "已写入本地。把 report.path 告诉用户，或让他把那份文件发给开发者。",
+            }),
+        ),
+        None => Response::error(500, "诊断报告写入失败：检查磁盘剩余空间与目录写权限。"),
+    }
+}
+
+fn uint(value: &Value, key: &str) -> Option<u32> {    value
         .get(key)
         .and_then(Value::as_u64)
         .and_then(|number| u32::try_from(number).ok())
@@ -1043,6 +1186,8 @@ fn guide(runtime: &Runtime) -> String {
 | GET | `/datasets/scan?path=...` | 检查一个数据集目录是否可用 |
 | POST | `/datasets/scan` | 同上，但路径放在 JSON body 里（中文路径免 percent-encode） |
 | GET | `/runs` | 列出历史训练与产物（应用重启后找旧模型的唯一途径） |
+| GET | `/diagnostics` | 列出本机诊断报告（失败自动生成，路径已脱敏） |
+| POST | `/diagnostics` | 上报一个「没报错但结果不对」的问题，服务端补全环境与日志 |
 | GET | `/settings` | 读配置 |
 | PUT | `/settings` | 改配置（整体替换，缺字段用默认值） |
 
@@ -1131,6 +1276,50 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 标注图**只能**落在应用自己的 `predictions/` 目录：请求里的 `output` 会被忽略，调用方无法把
 文件写回图片旁边，也无法指向任意路径。这样推理不会污染下一次的数据集扫描。
 
+## 出问题时：报告已经自动写好了
+
+`/train` 或 `/predict` 返回 `500` 时，服务端已经把一份诊断报告写到本地，并在响应里带回：
+
+```json
+{{"ok":false,"error":"引擎进程退出，代码 1","code":"engine_spawn_failed",
+ "hint":"先看报告里的「引擎日志尾部」…",
+ "diagnostics":{{"id":"20261113-123045-engine_spawn_failed",
+   "path":"C:\\\\Users\\\\…\\\\diagnostics\\\\20261113-123045-engine_spawn_failed.md",
+   "summary":"引擎进程退出，代码 1","pushed":true}}}}
+```
+
+**你不需要额外做什么。** 把 `error` 和 `hint` 讲给用户，再告诉他 `diagnostics.path` 那个文件
+在哪。报告里有版本、实际后端、引擎文件的修改时间、请求参数、以及最近 120 行引擎日志——
+这几样凑起来基本能定位问题。**用户名和数据集路径已分别替换成 `<user>` / `<dataset>`**，
+可以直接外发。
+
+`pushed: true` 表示摘要已经推到开发者那边（用户机器配置了上报通道时才有这个字段）；
+`pushed: false` 且带 `push_error` 说明推送没成功，但**报告仍在本地**，让用户手动发那份文件。
+
+错误响应现在一律带 `code`（机器可读）与可选的 `hint`（给人看的下一步）。别拿 `error` 的
+措辞去判断类型，那是会变的文案；按 `code` 分支。`400` 是「改请求」，`500` 是「我们这边坏了」，
+不要对 `500` 反复调参数重试。
+
+## 没报错但结果不对：主动留一份
+
+这是最容易漏的一类问题：`fitness` 连续几十轮是 0、训练 2 秒就结束、框全挤在左上角。
+它们**不产生任何错误码**，所以自动报告抓不到，但恰恰最需要被看到。
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{{"summary":"训练 30 轮 loss 从 456 降到 350，但 fitness 一直是 0",
+       "expected":"同一数据集用预训练权重能到 3.2% mAP",
+       "context":{{"architecture":"yolov8n","epochs":30,"imgsz":320}}}}' \\
+  "{{base}}/diagnostics"
+```
+
+返回 `202` 和 `report.path`。**这不是错误**：调用成功只表示报告写下了，不代表结论。
+写之前把「现象」和「预期」说清——这两句是判断问题唯一靠得住的东西，缺了它们，报告里剩下的
+只是环境参数。
+
+`GET /diagnostics?limit=20` 列出本机已有报告（`id` / `created` / `code` / `summary` /
+`pushed`），按时间倒序。它们是文件而不是内存状态，应用重启后仍在。
+
 ## 事件流（`/events`）
 
 响应是 `{{"ok":true,"cursor":N,"reset":false,"truncated":false,"events":[...]}}`：
@@ -1176,7 +1365,8 @@ curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/j
 ```
 
 可写字段：`engine_path`（null = 自动检测）、`default_device`、`output_dir`（null = 默认）、
-`control_enabled`、`control_port`（0 = 让系统选空闲端口）。改控制服务的开关或端口会**立即**
+`control_enabled`、`control_port`（0 = 让系统选空闲端口）、`feedback_kind`
+（`wecom` / `pushplus` / `generic`）、`feedback_webhook`（空字符串 = 只写本地报告，不外发）。改控制服务的开关或端口会**立即**
 重启监听，不需要重启应用；重启后 `GET /settings` 的 `control.port` 才是实际端口
 （端口被占用时可能不是你填的那个）。
 
@@ -1582,6 +1772,22 @@ mod tests {
             "best artifact missing: {best}"
         );
 
+        // The engine's stderr must be on disk now, not just in the log panel: this is the only
+        // record of a GPU `device lost` once the window closes, and the whole diagnostics feature
+        // depends on it.
+        let engine_log = service
+            .runtime
+            .engine()
+            .log_path()
+            .expect("the app engine must be built with a log dir");
+        let logged = std::fs::read_to_string(&engine_log).unwrap_or_default();
+        assert!(
+            logged.len() > 200,
+            "engine log is empty ({} bytes at {})",
+            logged.len(),
+            engine_log.display()
+        );
+
         // /runs must find, from disk, the run that just finished — this is the endpoint that
         // survives an app restart, where /state forgets everything.
         let runs = get(port, "/runs", Some(&token));
@@ -1846,5 +2052,123 @@ mod tests {
             message.contains("yolo26n-cls"),
             "must name the fix: {message}"
         );
+    }
+
+    #[test]
+    fn diagnostics_is_token_gated_and_starts_empty() {
+        let service = service("diag-auth");
+        let port = service.handle.port;
+        assert_eq!(get(port, "/diagnostics", None).status, 401);
+        let reply = get(port, "/diagnostics", Some(&service.handle.token));
+        assert_eq!(reply.status, 200);
+        // A fresh install has no `diagnostics/` directory; that is "nothing to report", not an
+        // error the client should surface.
+        assert_eq!(reply.json()["count"], 0);
+        assert_eq!(reply.json()["reports"].as_array().map(Vec::len), Some(0));
+    }
+
+    #[test]
+    fn a_client_report_gets_environment_and_a_real_file() {
+        let service = service("diag-post");
+        let port = service.handle.port;
+        let body = json!({
+            "summary": "训练 30 轮 loss 从 456 降到 350，但 fitness 一直是 0",
+            "expected": "同一数据集用预训练权重能到 3.2% mAP",
+            "context": { "architecture": "yolov8n", "epochs": 30 },
+        })
+        .to_string();
+        let reply = post(port, "/diagnostics", &service.handle.token.clone(), &body);
+        assert_eq!(reply.status, 202, "{}", reply.body);
+
+        let report = &reply.json()["report"];
+        let path = report["path"].as_str().expect("path").to_owned();
+        assert!(
+            std::path::Path::new(&path).is_file(),
+            "report was not written: {path}"
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("fitness 一直是 0"));
+        // The environment is filled in by the server, not by the client: a client cannot know the
+        // engine's mtime and must not be trusted to describe the machine.
+        assert!(text.contains("## 运行环境"), "{}", &text[..200.min(text.len())]);
+        assert!(text.contains(crate::version::VERSION));
+        // No channel configured in a test build, so nothing left the machine.
+        assert_eq!(report["pushed"], false);
+        assert!(report.get("push_error").is_none() || report["push_error"].is_null());
+
+        let listed = get(port, "/diagnostics?limit=5", Some(&service.handle.token));
+        assert_eq!(listed.json()["count"], 1);
+        assert_eq!(listed.json()["reports"][0]["code"], "assistant_report");
+    }
+
+    #[test]
+    fn a_report_without_a_summary_is_refused_because_it_says_nothing() {
+        let service = service("diag-nosummary");
+        let reply = post(
+            service.handle.port,
+            "/diagnostics",
+            &service.handle.token.clone(),
+            &json!({ "context": { "epochs": 3 } }).to_string(),
+        );
+        assert_eq!(reply.status, 400);
+        let message = reply.json()["error"].as_str().unwrap_or("").to_owned();
+        assert!(message.contains("summary"), "{message}");
+    }
+
+    /// The failure path that matters most: the engine dies, and the client did not ask for a
+    /// report. A 500 without one leaves the user with "推理失败：exit code 1" and nothing to send.
+    #[test]
+    fn a_failed_prediction_carries_a_written_report_without_being_asked() {
+        let dataset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("spikes")
+            .join("tiny-dataset");
+        let Some(source) = std::fs::read_dir(dataset.join("images").join("train"))
+            .ok()
+            .and_then(|entries| entries.filter_map(Result::ok).next())
+        else {
+            panic!("fixture dataset missing: {}", dataset.display());
+        };
+        let service = service("diag-predict");
+        let port = service.handle.port;
+        // Exists, so the request passes validation, but is not a usable Burnpack: the engine starts
+        // and fails, which is exactly the 500 path.
+        let fake = service.root.join("not-a-model.bpk");
+        std::fs::write(&fake, b"definitely not a burnpack").unwrap();
+
+        let body = json!({
+            "source": source.path().to_string_lossy(),
+            "model": fake.to_string_lossy(),
+        })
+        .to_string();
+        let reply = post(port, "/predict", &service.handle.token.clone(), &body);
+        assert_eq!(reply.status, 500, "expected an engine failure: {}", reply.body);
+        assert_eq!(reply.json()["code"], "engine_predict_failed");
+
+        let report = &reply.json()["diagnostics"];
+        let path = report["path"].as_str().unwrap_or_else(|| {
+            panic!("500 must carry a diagnostics path, got: {}", reply.body)
+        });
+        assert!(std::path::Path::new(path).is_file(), "{path}");
+        let text = std::fs::read_to_string(path).unwrap();
+        // The engine's own words, not our paraphrase — that detail is the reason the report exists.
+        assert!(
+            text.contains("Burnpack") || text.contains("INTERNAL"),
+            "engine stderr missing from the report: {text}"
+        );
+        assert!(text.contains("engine_predict_failed"));
+        // The temp paths in the context block contain the account name; redaction must catch the
+        // JSON-escaped spelling, which is how they actually appear.
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            if let Some(name) = home.rsplit(['\\', '/']).next() {
+                assert!(
+                    !text.contains(name),
+                    "account name {name:?} leaked into the report: {text}"
+                );
+            }
+        }
+        // The engine's own stderr is the reason this report is worth writing at all.
+        assert!(text.contains("引擎日志尾部"), "{text}");
     }
 }

@@ -1,0 +1,7 @@
+{
+  "_说明": "把 kind 与 webhook 填好再打包，所有安装了这个构建的机器都会自动上报失败摘要（只含版本、错误码、现象一句话与后端，不含路径与数据集名）。webhook 留空则只写本地报告、不外发。",
+  "_wecom": "企业微信群 → 右上角 ... → 消息推送 → 添加 → 复制 Webhook 地址，粘到 webhook 字段。",
+  "_pushplus": "pushplus.plus 微信扫码登录 → 一对一推送 → 复制 token 到 webhook 字段，kind 改为 pushplus。",
+  "kind": "wecom",
+  "webhook": ""
+}

@@ -300,11 +300,16 @@ Python**：安装包里带了每个架构的无权重骨架（`resources/onnx/<m
 | GET | `/datasets/scan?path=...` | 校验数据集目录 | 200 |
 | POST | `/datasets/scan` | 同上，路径放 JSON body（免 percent-encode） | 200 |
 | GET | `/runs` | 历史运行与可用产物（重启后找旧模型的唯一途径） | 200 |
+| GET | `/diagnostics?limit=N` | 本机诊断报告列表 | 200 |
+| POST | `/diagnostics` | 上报「没报错但结果不对」的问题 | 202 |
 | GET | `/settings` | 读配置（`SettingsView`） | 200 |
 | PUT | `/settings` | 整体替换配置 | 200 |
 
-错误一律是 `{"ok":false,"error":"人话"}`，状态码 `400`（参数/路径）、`401`（令牌）、
+错误一律是 `{"ok":false,"error":"人话","code":"..."}`，状态码 `400`（参数/路径）、`401`（令牌）、
 `404`（端点）、`405`（方法）、`409`（已有训练在跑）、`500`（引擎/磁盘）、`503`（并发超限）。
+
+**按 `code` 分支，不要按 `error` 的措辞分支。** 措辞会改，`code` 是契约。`/train` 与 `/predict`
+的 `500` 还带 `hint`（给人看的下一步）与 `diagnostics`（见 9.10）。
 
 **`400` 与 `500` 的分界是"谁该改"**：`400` 表示参数或路径不对，改请求就能过；`500` 表示
 服务或引擎这边失败了，改请求没用。`/predict` 曾把引擎崩溃也报成 `400`，客户端于是一直在
@@ -504,11 +509,16 @@ POST 版本接受 JSON body，**中文或带空格的路径用它更省事**，�
 
 ```json
 {"engine_path":null,"default_device":"cpu","output_dir":null,
- "control_enabled":true,"control_port":47821}
+ "control_enabled":true,"control_port":47821,
+ "feedback_kind":"wecom","feedback_webhook":""}
 ```
 
 **必须是完整对象**：Rust 侧用 `#[serde(default)]` 反序列化，漏字段会被静默还原成默认值。
 改 `control_enabled` / `control_port` 会立即重启监听，不需要重启应用。
+
+`feedback_webhook` 为空表示只写本地报告、不外发。它默认来自构建时的
+`desktop/src-tauri/resources/feedback.json`，所以分发出去的包开箱就会上报，最终用户不需要
+配置任何东西。
 
 ### 9.8 与 UI 的一致性
 
@@ -572,6 +582,70 @@ GET /runs?limit=10      // limit 默认 50，上限 200
 **路径的分隔符不保证与 `/state` 一致**：这里的 `best` 由服务端用平台分隔符拼接（`…\exports\best.bpk`），
 而 `/state` 的 `best` 是引擎原样输出的（可能写成 `…/exports/best.bpk`）。两者指向同一个文件，
 **不要用字符串比较，用文件系统解析后的结果判断**（端到端测试就是这样做断言的）。
+
+---
+
+### 9.10 诊断报告（`/diagnostics`）
+
+**失败时报告是自动写的，不需要调用方做任何事。**
+
+`POST /train` 引擎启动失败、`POST /predict` 引擎失败、以及训练跑到一半以 `failed` 收尾，
+这三种情况服务端会把一份报告写到 `%APPDATA%\com.yolotrainer.desktop\diagnostics\`，
+并在响应里带回：
+
+```json
+{"ok":false,"error":"引擎进程退出，代码 1","code":"engine_spawn_failed",
+ "hint":"先看报告里的「引擎日志尾部」…",
+ "diagnostics":{"id":"20261113-123045-engine_spawn_failed",
+   "path":"C:\\Users\\…\\diagnostics\\20261113-123045-engine_spawn_failed.md",
+   "summary":"引擎进程退出，代码 1","pushed":true}}
+```
+
+调用方该做的只有一件事：把 `error`、`hint` 讲给用户，并告诉他 `diagnostics.path` 文件在哪。
+
+| 字段 | 含义 |
+| --- | --- |
+| `id` | 报告标识，等于文件名去扩展名，可直接用于 `GET /diagnostics?id=` |
+| `path` | 报告绝对路径 |
+| `summary` | 一句话现象（已脱敏），也是推送出去的内容 |
+| `pushed` | 摘要是否真的到了开发者通道。`false` 不代表报告丢了，它仍在磁盘上 |
+| `push_error` | 推送失败原因，仅在失败时出现 |
+
+**脱敏范围**：用户名替换为 `<user>`，数据集路径替换为 `<dataset>`，JSON 块里的 `\\` 转义形式
+同样处理。盘符与目录层级保留——「E 盘满了」「深层目录没权限」正是需要它的场景。
+图片路径、`config.resolved.json`、引擎 stderr 尾部 120 行都在报告里。
+
+**为什么自动而不是靠调用方上报**：助手没有「报 bug」这个目标，它只会重试或换参数。任何
+「遇到问题请调用 /feedback」的设计实际命中率都很低。所以报告必须由失败的那次请求自己产生。
+
+`GET /diagnostics?limit=20` 列出本机报告（按时间倒序，`id` / `created` / `code` / `summary` /
+`pushed`）。目录不存在时返回 `count: 0` 而不是错误——全新安装本来就没有失败过。
+
+`POST /diagnostics` 用于**没有错误码的问题**：
+
+```bash
+curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"summary":"训练 30 轮 loss 从 456 降到 350，但 fitness 一直是 0",
+       "expected":"同一数据集用预训练权重能到 3.2% mAP",
+       "context":{"architecture":"yolov8n","epochs":30,"imgsz":320}}' \
+  "{base}/diagnostics"
+```
+
+返回 `202` + `report`。`summary` 必填且 ≤2000 字，`expected` 与 `context` 可选。
+
+**这类问题最容易被漏掉**：mAP 恒为 0、训练 2 秒结束、框全挤在角落，都不会抛错，所以自动
+报告抓不到。这两句（现象 + 预期）是判断问题唯一靠得住的东西，比任何环境参数都有价值。
+
+### 9.11 引擎日志落盘
+
+引擎的 stderr 与所有人类可读输出同时写入 `%APPDATA%\com.yolotrainer.desktop\logs\engine.log`
+（每次写入立即 flush，单文件上限 8 MiB，滚动保留一个 `engine.log.1`）。
+
+**这是整个诊断链路的前提**：此前 stderr 只进内存 hub，窗口一关，GPU `device lost`、
+panic、ONNX 形状不匹配的证据就永久消失，用户只能说「它失败了」。
+
+`/predict` 不走常驻引擎进程，它的一次性 stderr 直接进错误的 `error` 字段，因此预测失败的
+报告里「日志尾部」可能是空的，但「发生了什么」那段就是引擎原文。
 
 ---
 

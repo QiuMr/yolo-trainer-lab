@@ -10,11 +10,13 @@ import {
   Eye,
   EyeOff,
   FileSearch,
+  FolderOpen,
   FolderOutput,
   FolderSearch,
   Loader2,
   Power,
   RotateCcw,
+  ShieldCheck,
   Sparkles,
   Zap,
 } from "lucide-react";
@@ -22,6 +24,7 @@ import { Badge, Button, Card, SectionTitle, cx } from "../components/ui";
 import UpdateCard from "../components/UpdateCard";
 import {
   getSettings,
+  openDiagnosticsFolder,
   pickEngineFile,
   pickFolder,
   saveSettings,
@@ -105,6 +108,8 @@ export default function SettingsPage({
         output_dir: view.output_dir_is_default ? null : view.output_dir,
         control_enabled: view.control.enabled,
         control_port: view.control.port,
+        feedback_kind: view.feedback_kind,
+        feedback_webhook: view.feedback_webhook,
         ...patch,
       });
       setView(next);
@@ -417,6 +422,72 @@ export default function SettingsPage({
           把提示词粘贴给任意 AI 助手，它会先读接口文档再动手。
           服务只绑定 127.0.0.1，外部网络连不上。
         </p>
+      </Card>
+
+      <Card className="mt-4" enter={4}>
+        <SectionTitle
+          icon={ShieldCheck}
+          title="问题上报"
+          hint="训练或推理失败时，自动留一份可发给开发者的诊断报告。"
+          action={
+            view.feedback_webhook ? (
+              <Badge tone="ok" icon={Activity}>
+                已开启
+              </Badge>
+            ) : (
+              <Badge tone="neutral">仅本地</Badge>
+            )
+          }
+        />
+
+        <div className="rounded-[10px] border border-line-strong px-4 py-3.5">
+          <div className="flex items-center gap-2 text-[12px] font-bold">
+            <span
+              className={cx(
+                "h-2 w-2 shrink-0 rounded-full",
+                view.feedback_webhook ? "bg-ok" : "bg-ink-faint",
+              )}
+            />
+            {view.feedback_webhook
+              ? "失败摘要会发送给开发者"
+              : "报告只写在本机，不会外发"}
+          </div>
+          <div className="mt-2 text-[12px] leading-relaxed font-medium text-ink-soft">
+            发出去的只有版本、错误码、一句话现象、后端类型和引擎文件的时间。
+            <span className="font-bold">
+              不含
+            </span>
+            用户名、数据集路径和图片。
+          </div>
+        </div>
+
+        <p className="mt-3 text-[11px] leading-relaxed font-medium text-ink-faint">
+          完整报告在 {view.diagnostics_dir}，里面的用户名与数据集路径已替换成
+          {" "}
+          <code className="font-mono font-semibold">{"<user>"}</code>
+          {" / "}
+          <code className="font-mono font-semibold">{"<dataset>"}</code>
+          ，可以直接发给开发者。
+        </p>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2">
+          <Button
+            icon={FolderOpen}
+            onClick={() => {
+              void openDiagnosticsFolder().catch((cause: unknown) =>
+                setError(typeof cause === "string" ? cause : String(cause)),
+              );
+            }}
+          >
+            打开报告文件夹
+          </Button>
+          <Button
+            icon={Copy}
+            onClick={() => void copy(view.diagnostics_dir, "报告目录已复制")}
+          >
+            复制目录路径
+          </Button>
+        </div>
       </Card>
 
       {/* Last card: low-frequency, and it owns its own network state so the rest of the page

@@ -14,6 +14,48 @@ use serde::{Deserialize, Serialize};
 /// Values `--device` accepts. Kept in sync with montgomery's `DeviceSelection`.
 pub const DEVICES: [&str; 3] = ["auto", "cpu", "gpu"];
 
+/// Accepted `feedback_kind` values, most useful first.
+pub const FEEDBACK_KINDS: [&str; 3] = ["wecom", "pushplus", "generic"];
+
+/// Build-time default channel, from `resources/feedback.json`.
+///
+/// Why this is compiled in rather than configured per install: the person who distributes the
+/// build sets it once, and every copy then reports without the end user knowing a webhook exists.
+/// An end user asked to configure a webhook before reporting a bug does not report the bug — and
+/// that is the whole problem this feature exists to solve.
+///
+/// A per-install override still wins (the `feedback_*` fields in `settings.json`), so a user who
+/// runs their own build is not locked to whatever shipped.
+pub const BUNDLED_FEEDBACK: &str = include_str!("../resources/feedback.json");
+
+/// `(kind, webhook)` from the bundled file. Never fails: a malformed file means "no reporting",
+/// which is a worse feature but never a broken app.
+fn bundled_feedback() -> (String, String) {
+    static CACHE: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            #[derive(Deserialize)]
+            struct Bundled {
+                #[serde(default)]
+                kind: String,
+                #[serde(default)]
+                webhook: String,
+            }
+            match serde_json::from_str::<Bundled>(BUNDLED_FEEDBACK) {
+                Ok(found) => {
+                    let kind = if FEEDBACK_KINDS.contains(&found.kind.as_str()) {
+                        found.kind
+                    } else {
+                        FEEDBACK_KINDS[0].to_owned()
+                    };
+                    (kind, found.webhook.trim().to_owned())
+                }
+                Err(_) => (FEEDBACK_KINDS[0].to_owned(), String::new()),
+            }
+        })
+        .clone()
+}
+
 /// Coerce a requested device into one `--device` accepts, falling back when it is blank.
 ///
 /// This is the **single source** of the rule. Both the engine spawn path and the HTTP control
@@ -51,16 +93,27 @@ pub struct Settings {
     pub control_enabled: bool,
     /// `0` asks the OS for a free port; the actual port is reported back in `SettingsView`.
     pub control_port: u16,
+    /// Where a failure summary is pushed. Empty means "only write the local report".
+    ///
+    /// A group-robot webhook URL (WeCom) or a PushPlus token, depending on `feedback_kind`. It is
+    /// pasted by the person distributing the build, not by the end user: an end user who has to
+    /// configure a webhook before reporting a bug will not report it.
+    pub feedback_webhook: String,
+    /// `wecom` | `pushplus` | `generic`. Anything else is treated as `generic`.
+    pub feedback_kind: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
+        let (feedback_kind, feedback_webhook) = bundled_feedback();
         Self {
             engine_path: None,
             default_device: "auto".into(),
             output_dir: None,
             control_enabled: true,
             control_port: DEFAULT_CONTROL_PORT,
+            feedback_webhook,
+            feedback_kind,
         }
     }
 }
@@ -80,6 +133,10 @@ impl Settings {
             .output_dir
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty());
+        self.feedback_webhook = self.feedback_webhook.trim().to_owned();
+        if !FEEDBACK_KINDS.contains(&self.feedback_kind.as_str()) {
+            self.feedback_kind = FEEDBACK_KINDS[0].to_owned();
+        }
         if !DEVICES.contains(&self.default_device.as_str()) {
             self.default_device = "auto".into();
         }

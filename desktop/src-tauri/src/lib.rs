@@ -30,7 +30,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 mod control;
 mod dataset;
+mod diagnostics;
 mod engine;
+mod feedback;
 mod onnx_export;
 mod predict;
 mod pretrained;
@@ -151,6 +153,23 @@ fn get_settings(runtime: State<'_, Runtime>) -> Result<SettingsView, String> {
     Ok(runtime.view())
 }
 
+/// Open the folder holding the local failure reports.
+///
+/// Created on demand: a build that has never failed has no `diagnostics/` directory, and opening
+/// a path that does not exist shows the user a Windows error instead of an empty folder.
+#[tauri::command]
+fn open_diagnostics_folder(
+    app: tauri::AppHandle,
+    runtime: State<'_, Runtime>,
+) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let root = runtime.diagnostics_root();
+    std::fs::create_dir_all(&root).map_err(|error| format!("无法创建诊断目录：{error}"))?;
+    app.opener()
+        .open_path(root.to_string_lossy(), None::<&str>)
+        .map_err(|error| format!("无法打开目录：{error}"))
+}
+
 /// Every pretrained weight this build offers, plus whether it is already on disk.
 ///
 /// Sync and cheap: it only stats a few files. The window calls it when the train page opens and
@@ -217,6 +236,7 @@ pub fn run() {
             save_settings,
             pretrained_catalog,
             download_pretrained,
+            open_diagnostics_folder,
             app_version,
             check_update,
             install_update

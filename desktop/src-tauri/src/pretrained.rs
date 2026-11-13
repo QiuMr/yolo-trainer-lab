@@ -180,7 +180,7 @@ fn verify(path: &Path, entry: &Entry) -> Result<(), String> {
 /// application does. Without this, building the first client panics inside reqwest's worker thread —
 /// and because that thread is not the caller's, the panic surfaces as the unhelpful
 /// "event loop thread panicked".
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         // An error here means someone else installed one first, which is equally fine: all that
