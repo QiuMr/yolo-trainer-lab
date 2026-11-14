@@ -1,5 +1,32 @@
 # 变更记录
 
+## 2026-11-14 · 回馈上游：7 个 fix 拆成 2 个 PR，cubecl 另提 1 个 issue
+
+起因是「有要提交给上游的东西吗」。把本地对 `research/montgomery` 的 13 个文件改动逐个过了一遍，
+按「上游自己的 bug」和「我们产品的代码」分开。**产品代码一行没提**（事件流、离线导出、设备探针）。
+决策见 D034。
+
+**PR #14 · warmup + resume**（https://github.com/boquila/montgomery/pull/14，115 passed）
+- `warmup_steps` 恒为 0 导致 `YoloxWarmCosine` 实为纯 cosine；改为按家族自动算。
+- `--no-val` / `--checkpoint-interval` 在 resume 时打不到 scheduler；resume 后重算 total_steps。
+
+**PR #15 · 类别数贯穿导出与预训练迁移**（https://github.com/boquila/montgomery/pull/15，119 passed）
+- `with_num_classes` 不改 `cls_channels`，n 档 3 类模型保留 80 宽塔，导出 cv3 形状全错。
+- 导出用目录默认类别数（80/1000/19）而非 checkpoint 实际值。
+- YOLO26 的 `o2m_*` 训练专用张量写进 snapshot，Ultralytics 重建报 unexpected keys。
+- 80 类权重迁到 3 类模型时塔宽不符直接整单失败；改为只吸收塔体、其余仍致命。
+- 附带 mAP 口径的注释与锁值测试（51/101），防止再被「优化」成线性插值。
+
+**cubecl issue #2193**（https://github.com/tracel-ai/cubecl/issues/2193）
+- 这块核显在 Vulkan/DX12 下都拿不到 timestamp readback（`BufferAsyncError`），
+  但相同设备上「一次 kernel + 读回」的探针能过——**能算，只是测不了时间**。
+- 三层容错链被写死的断言短路：`timings.rs:510` 的 `expect`、`local.rs:224` 的
+  `expect("Should run when selected by autotune.")`、`schedule.rs:476` 漏了 `NotMeasured` 变体。
+- 逐层绕过（vendor 副本，**未入产品依赖**）后不再 panic，但训练进程段错误退出（exit 139）。
+  因此结论不变：**这台机器只能用 CPU**；`--device auto` 的探针回退保持原样。
+- 附带发现：候选池按能力过滤但不按 input 的 launch 参数过滤（`conv_depthwise` 在 `groups=1`
+  的输入上被 offer，随后报 `weight channels per group is 16`）。
+
 ## 2026-11-14 · 升 Burn 0.22.1（修 batch=1 错梯度）；warmup 从死代码变真的；修 resume 配置分裂
 
 起因是审 `research/montgomery` 的训练源码。查出三件事：上游今天推了 GPU 修复、引擎的

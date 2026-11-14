@@ -19,25 +19,53 @@
 | resume 时 CLI 覆盖 | ✅ 代码 / ⏳ 未端到端 | 改为统一读 `trainer.config`，`events::Start` 报真实 epochs；**还没跑「resume + `--no-val`」的真实对局** |
 | resume 后重算 LR 总步数 | ✅ 代码 / ⏳ 未端到端 | 按新 `batch_count` 重算 `total_steps`，warmup 压回新总量内；同上未端到端 |
 | mAP 口径 | ✅ 结论：不改 | 与 pycocotools 的 precision 包络等价（它不做线性插值）；补注释 + 单测锁语义 |
-| Vega 6 能否训练 | ❌ 不能，且与 #13 无关 | 见下 |
+| Vega 6 能否训练 | ❌ 不能，原因已定位到 cubecl 的 timestamp 回读 | 见下 |
 
-**GPU 实测（2026-11-14，升级到 Burn 0.22.1 之后）**：
+**GPU 实测（2026-11-14，三轮）**：
+
+第一轮，Vulkan（Burn 0.22.1 默认）：
 
 ```
 $ montgomery.exe __device-probe --device gpu
-thread 'DSD-4-0' panicked: Failed to map buffer: BufferAsyncError        ×7
-thread 'main'     panicked: The device is poisoned / Unexpected error variant
-                            (driver implementation is at fault)
+panicked: Failed to map buffer: BufferAsyncError                     ×7
+main panicked: The device is poisoned (driver implementation is at fault)
 exit=101
 ```
 
-- **连设备探针都过不了**，所以不是 depthwise 的问题：cubecl-wgpu 0.11.4 在这台机器的 AMD
-  驱动上基础 buffer 映射就失败。
-- #13 的回归测试 `wgpu_depthwise_batch_one_backward` 同样 `Device is lost`，升级没有改善。
-- 结论：**这台机器只能用 CPU**。`--device auto` 的 probe 会失败并回退 CPU（已有设计），
-  所以正常使用不需要手动改。要把「任意显卡」这个卖点验证掉，必须换一台 N 卡的机器。
+第二轮，DX12（本地 `MONTGOMERY_WGPU_BACKEND` 钩子）：
+
+```
+$ MONTGOMERY_WGPU_BACKEND=dx12 montgomery.exe __device-probe --device gpu
+Device probe: AMD Radeon(TM) Graphics (spirv_4098_5688) ok (sum 32768)
+exit=0
+```
+
+**探针过了**——所以设备能算，第一轮失败不是「跑不了 kernel」，而是「测不了时间」。
+但同一个后端下真实训练仍在 `cubecl-wgpu-0.11.4/src/compute/timings.rs:510` 挂掉。
+
+第三轮，vendor 副本打三处补丁（`timings.rs` 的 expect → `None`、`local.rs` 的 Hit 兜底、
+`schedule.rs` 的 `NotMeasured` 变体）：不再 panic，但进程**段错误退出（exit 139）**，
+第一个 epoch 都没到。补丁未进产品依赖，`Cargo.toml` 的 `[patch.crates-io]` 已撤销。
+
+结论：**这台机器只能用 CPU**。`--device auto` 的 probe 会失败并回退 CPU（已有设计），
+正常使用不需要手动改。要把「任意显卡」这个卖点验证掉，必须换一台 N 卡的机器；
+Vega 6 这条路已经查到 cubecl 的 autotune 层，不是 #13 能修的。
 
 **顺带记录**：上游 #12（4,000 行 `src/dataset/` 重构）已评估、决定暂不合，理由见 D033。
+
+## 上游回馈（2026-11-14）
+
+本地 13 个文件的上游改动已按「上游自己的 bug / 我们产品的代码」分开，产品代码一行没提。
+决策见 D034。
+
+| 去处 | 内容 | 状态 |
+| --- | --- | --- |
+| PR boquila/montgomery#14 | warmup 死代码；resume 时 CLI 覆盖与 LR 总步数 | 已开，115 passed |
+| PR boquila/montgomery#15 | 类别数贯穿 cls_channels / 导出 / 预训练迁移；o2m_ 泄漏；mAP 口径注释 | 已开，119 passed |
+| issue tracel-ai/cubecl#2193 | timestamp 回读失败不该杀设备；三层容错链被断言短路 | 已开 |
+
+PR 分支在 `research/pr-upstream`（git worktree），fork 在 `QiuMr/montgomery`。
+`research/vendor/` 下的 cubecl 副本只作实验记录与 issue 附件，**不参与构建**。
 
 ## 诊断与问题上报（2026-11-13，测试实测）
 

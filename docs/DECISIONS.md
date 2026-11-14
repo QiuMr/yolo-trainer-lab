@@ -1121,3 +1121,45 @@ CPU 回退。这是「同一份代码在任意显卡上训练」这个唯一卖�
 kernel 行为变化可能让 Vega 6 的 `device lost` 换个形态出现，也可能消失。只能在真机上实测，
 不能从 changelog 推断。
 
+
+## D034 · cubecl 在 Vega 6 上拿不到 timestamp：三层补丁只用来定位，不进产品
+
+**背景**：升级到 Burn 0.22.1 / cubecl 0.11.4 后，这台机器（Ryzen 5 5560U / Radeon Vega 6）
+在 Vulkan 下 `__device-probe` 就失败（`Failed to map buffer: BufferAsyncError` ×7，随后
+`device is poisoned`）。为了判断「到底是显卡不能算，还是只是测不了时间」，用本地
+`MONTGOMERY_WGPU_BACKEND` 钩子切到 DX12：**探针通过**（`ok (sum 32768)`），说明设备能算。
+
+**在 DX12 下逐层绕过，共三处，都是 cubecl 自己的容错链被写死的断言短路**：
+
+1. `cubecl-wgpu/src/compute/timings.rs:510`：`stop_profile` 用 `.expect("Failed to map buffer")`。
+   但 `new_device_time_maybe` 的签名就是 `Future<Output = Option<ProfileTicks>>`，
+   「没测到」本来就有表达方式；`tuner.rs` 的注释也写明「unmeasured decision is a guess made to
+   keep the device thread alive」。**上层要让它活着，这个 expect 把它弄死了**，还顺带 poison 设备。
+2. `cubecl-runtime/src/tune/local.rs:224`：缓存命中后 `.expect("Should run when selected by
+   autotune.")`。绕过第 1 层后所有候选都 unmeasured，autotune 按设计缓存一个「猜的」索引，
+   这里直接执行并断言成功 → 立刻炸在 `conv_depthwise: groups is 1, ... weight channels per
+   group is 16`。同函数的 `Pending` 分支已经写好「逐个试」的兜底，`Hit` 分支没有。
+3. `cubecl-runtime/src/tune/schedule.rs:476`：全部候选失败时挑一个 unmeasured 继续的逻辑，
+   `matches!` 里只写了 `Unknown | InvalidSamples`，漏了 `NotMeasured`。绕过第 2 层后 6 个
+   候选全是 `NotMeasured`，于是 panic。
+
+**绕过三层之后**：不再 panic，训练进程在第一个 epoch 前**段错误退出**（exit 139，无 Rust panic）。
+无法区分「核显真的跑不了这些 kernel」还是「autotune 选中了参数不符的候选导致越界」——
+后者更可能，因为第 2 层那条错误已经证明**候选池按能力过滤、但不按 input 的 launch 参数过滤**。
+
+**决策**：
+- vendor 副本（`research/vendor/cubecl-{wgpu,runtime}`）**只作实验记录与 issue 附件**，
+  `Cargo.toml` 的 `[patch.crates-io]` 已撤销，发版产物一律用 registry 原版。
+- 不再加第四层补丁（禁用 autotune / 固定保守 kernel）。理由：绕过测量去选 kernel 无法保证
+  数值正确，而「静默算错」正是 D033 要避免的那类 bug；宁可明确不支持。
+- 结论维持：**这台机器只能用 CPU**。`--device auto` 的探针回退是对的，不需要改。
+
+**被否决的方案**：
+- 「把 `--device auto` 改成 Vulkan 失败就试 DX12」：DX12 只是让探针通过，训练照样进不去，
+  改了只会让用户多等一轮再失败。
+- 「关掉 burn fusion 试试」：fusion 只是放大错误（`Tensor was never written`），根在 autotune
+  选 kernel，不在融合。
+- 「`CUBECL_AUTOTUNE_LEVEL=0`」：Minimal 只是减少测量比例（60%），仍然要测，仍会走到第 1 层。
+
+**回馈**：三处都整理成 issue 草稿（`research/cubecl-issue.md`）。这是比给 montgomery 提
+7 个 fix 更有价值的东西——如果 cubecl 修了，这块核显可能真能训；现在只差这一步。
