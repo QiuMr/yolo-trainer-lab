@@ -1083,3 +1083,41 @@ token）作为备选，同样零成本。
 **已知边界**：训练中途失败的报告由折叠线程 spawn 的后台线程写，去重键是 `run_dir|code`。
 引擎会先发 `error` 再发 `exit`，两次都让状态变 `failed`；没有去重键就会一次崩两条报告，
 并按每分钟 3 条的上限把推送额度耗掉两条。
+
+---
+
+## D033 · 引擎依赖升到 Burn 0.22.1：batch=1 的 depthwise 反向此前算错；上游 #12 暂不合
+
+**日期**：2026-11-14
+
+**背景**：montgomery 是单人项目（José Díaz），2.5 个月 47,643 行 / 124 文件，迭代很快。
+它于 2026-11-14 11:43（北京时间）推了 #13 `fix: update Burn GPU stack for batch-one backward`：
+burn 0.22.0 → **0.22.1**、cubecl 0.11.0 → **0.11.4**，并新增回归测试
+`wgpu_depthwise_batch_one_backward`。
+
+**决定**：把 `Cargo.toml` 的 `=0.22.0` 精确锁升到 `=0.22.1`、`cubecl` 到 `=0.11.4`，
+取上游的 `Cargo.lock` 与 `src/training/capability.rs`（含那条新测试）。
+
+**为什么必须升**：batch=1 的 depthwise 卷积反向在 WGPU 上走 gather 路径，此前算错——不是崩，
+是**静默的错梯度**。而我们恰好有两条会落到 batch=1 的路径：显存不足自动降 batch、
+CPU 回退。这是「同一份代码在任意显卡上训练」这个唯一卖点下面最危险的地雷：
+训练会跑完、loss 会降，只是学得不对。
+
+**已评估、不做：上游 #12 `more cli utils`**。标题像小工具，实际是 4,000 行的 `src/dataset/`
+重构（`annotations` / `inspect` / `manifest` / `rle` / `transform` + `data_cli.rs`），
+并把 `src/training/data/manifest.rs` 削掉 384 行搬过去。本地工作区已有 11 个改动文件
+（导出模板、事件流），其中 `lib.rs` / `main.rs` 也在改，冲突面大且当前没有收益。
+等真要整批同步上游时再做，届时先把本地 patch 收成一个独立分支。
+
+**否定过的方案**：
+- *直接 `git merge origin/main`* —— 会把 #12 的 4,000 行一起带进来，且 `lib.rs` / `main.rs`
+  必然冲突。为一个依赖版本号付这个代价不划算。
+- *只升 burn 不升 cubecl* —— 两者在同一 PR 里一起升，`Cargo.lock` 的解析约束也绑在一起，
+  拆开要自己维护补丁版 lock。
+- *等上游发 release/tag* —— 只有 `v0.1.0` 一个 tag，`Cargo.toml` 里 version 还是 0.1.0，
+  上游不发版本号，等 tag 等于永远不升。
+
+**已知风险**：升级不改我们的 patch（`export/*`、`training/events.rs`），但 Burn 0.22.1 的
+kernel 行为变化可能让 Vega 6 的 `device lost` 换个形态出现，也可能消失。只能在真机上实测，
+不能从 changelog 推断。
+

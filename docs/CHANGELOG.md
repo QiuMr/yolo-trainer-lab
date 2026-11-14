@@ -1,5 +1,36 @@
 # 变更记录
 
+## 2026-11-14 · 升 Burn 0.22.1（修 batch=1 错梯度）；warmup 从死代码变真的；修 resume 配置分裂
+
+起因是审 `research/montgomery` 的训练源码。查出三件事：上游今天推了 GPU 修复、引擎的
+warmup 从来没生效过、resume 时 CLI 覆盖到不了 scheduler。决策与被否决方案见 D033。
+
+- **依赖升级（上游 #13）**：burn 0.22.0 → **0.22.1**、cubecl 0.11.0 → **0.11.4**。
+  修的是 batch=1 的 depthwise 卷积反向在 WGPU 上走 gather 路径**算错梯度**——不是崩溃，
+  是跑完、loss 在降、但学得不对。我们有两条会落到 batch=1 的路径：显存不足降 batch、
+  CPU 回退。这是「任意显卡都能训」这个卖点下最危险的一类 bug。
+- **warmup 此前是死代码**：`warmup_steps` 全项目唯一赋值是 0（在 `TrainingConfig::yolox()`），
+  也没有 CLI 参数，于是 `LrScheduler` 的 warmup 分支永不执行，
+  `ScheduleKind::YoloxWarmCosine` 名字里的 Warm 是假的，实际就是纯 cosine。
+  现在按家族自动算：YOLOX 5 个 epoch 的步数，其余 3 个，总量封顶在总步数的 1/10，
+  少于 10 步则不 warmup（一成就近似零）。显式填值仍然优先，探针和单测可以跳过 ramp。
+- **resume 的配置分裂**：`Trainer::from_checkpoint` 用 checkpoint manifest 里的 config，
+  而 CLI 覆盖（`--no-val`、`--checkpoint-interval`）改的是另一个局部副本，永远到不了
+  scheduler 和下一次 checkpoint —— resume + `--no-val` 会继续验证。统一读 `trainer.config`；
+  `events::Start` 也改为报真实 epochs（resume 时 `request.epochs` 是被忽略的）。
+- **resume 后 LR 总步数重算**：`scheduler.total_steps` 原样持久化在 checkpoint 里，
+  数据集变大或变小后剩余 LR 曲线仍按旧规模走，会提前触底。现在按新 `batch_count` 重算，
+  并把 warmup 压回新总步数以内（否则 `regular_steps` 会算出负数）。
+- **mAP 口径：核对后决定不改**。原计划改成「COCO 101 点线性插值」，读过 pycocotools 的
+  `accumulate` 后发现它**不做线性插值**：先建 precision 右→左包络，再对 101 个 recall 阈值
+  searchsorted 取值。现有实现「对每个阈值取 recall 达标点的 precision 最大值」与它等价。
+  改了反而让所有 mAP 偏离参照，所以只补了注释和一条锁语义的测试，防止后人再"优化"一遍。
+- 顺手修了 `export/template.rs` 一处测试编译错误：`Manifest` 新增 `scalars`/`attributes`
+  字段后，字面量初始化没跟上，`cargo check` 不报（那段在 `#[cfg(test)]` 里）。
+
+测试：引擎 `cargo test --features training --lib` **120 passed / 0 failed / 315 ignored**。
+新增 3 条：warmup 边界、AP 包络语义、上游带来的 WGPU batch=1 回归（默认 ignore）。
+
 ## 2026-11-13 · 失败自动留诊断；引擎 stderr 落盘；失败摘要推到手机
 
 起因是用户提出「用户没地方反馈 bug，AI 遇到问题应该能精准反馈，收不到就太可惜了」。

@@ -1,10 +1,43 @@
-# 项目状态（2026-11-13）
+# 项目状态（2026-11-14）
 
 ## 一句话结论
 
 **montgomery 的完整链路可用**：数据 → 训练 → 导出 `.bpk` → 推理，全部在本机跑通（CPU 后端）。
 桌面壳、AI 操控接口、45 个模型选择器、分类链路、单图推理都已闭环；本轮补上 GitHub 仓库、
 版本管理与自动更新。GPU 后端在这台机器上不可靠，需换独显机器验证。
+
+## 训练源码审计与引擎修正（2026-11-14）
+
+审了 `research/montgomery` 的整条训练链路（47,643 行 / 124 文件）。作者仍在活跃开发——
+2026-11-14 11:43（北京时间）刚推了 GPU 修复 #13，单人主导（José Díaz），外部贡献一次。
+上游迭代快，但**质量抽查必须自己做**：这一轮就查出三处不会报错、只会悄悄训坏的问题。
+
+| 项 | 状态 | 怎么验的 |
+| --- | --- | --- |
+| 合入上游 #13（Burn 0.22.1 / cubecl 0.11.4） | ✅ | `Cargo.toml` 锁 `=0.22.1` / `=0.11.4`；`cargo check --features training` 3m47s 通过 |
+| warmup 真正生效 | ✅ | 新增单测锁边界（YOLOX 5 ep / 其余 3 ep / 总量 1/10 封顶 / <10 步不 ramp）；`Trainer::create` 按 recipe 计算，显式值优先 |
+| resume 时 CLI 覆盖 | ✅ 代码 / ⏳ 未端到端 | 改为统一读 `trainer.config`，`events::Start` 报真实 epochs；**还没跑「resume + `--no-val`」的真实对局** |
+| resume 后重算 LR 总步数 | ✅ 代码 / ⏳ 未端到端 | 按新 `batch_count` 重算 `total_steps`，warmup 压回新总量内；同上未端到端 |
+| mAP 口径 | ✅ 结论：不改 | 与 pycocotools 的 precision 包络等价（它不做线性插值）；补注释 + 单测锁语义 |
+| Vega 6 能否训练 | ❌ 不能，且与 #13 无关 | 见下 |
+
+**GPU 实测（2026-11-14，升级到 Burn 0.22.1 之后）**：
+
+```
+$ montgomery.exe __device-probe --device gpu
+thread 'DSD-4-0' panicked: Failed to map buffer: BufferAsyncError        ×7
+thread 'main'     panicked: The device is poisoned / Unexpected error variant
+                            (driver implementation is at fault)
+exit=101
+```
+
+- **连设备探针都过不了**，所以不是 depthwise 的问题：cubecl-wgpu 0.11.4 在这台机器的 AMD
+  驱动上基础 buffer 映射就失败。
+- #13 的回归测试 `wgpu_depthwise_batch_one_backward` 同样 `Device is lost`，升级没有改善。
+- 结论：**这台机器只能用 CPU**。`--device auto` 的 probe 会失败并回退 CPU（已有设计），
+  所以正常使用不需要手动改。要把「任意显卡」这个卖点验证掉，必须换一台 N 卡的机器。
+
+**顺带记录**：上游 #12（4,000 行 `src/dataset/` 重构）已评估、决定暂不合，理由见 D033。
 
 ## 诊断与问题上报（2026-11-13，测试实测）
 
