@@ -347,6 +347,49 @@ export async function scanDataset(path: string): Promise<DatasetSummary> {
   return await invoke<DatasetSummary>("scan_dataset", { path });
 }
 
+/**
+ * The answer to "will training actually run on this machine?".
+ *
+ * Deliberately not called `GpuInfo`: the question is not what hardware is installed — Windows
+ * answers that — but whether a run reaches epoch one. The reference machine for this project has an
+ * adapter that Windows reports, that wgpu opens, and that dies on the first readback, so the only
+ * honest test is executing a kernel, which is what the shell does here.
+ *
+ * Mirrors `engine::DeviceReport` in src-tauri/src/engine.rs.
+ */
+export type DeviceReport = {
+  /** What was asked for: `auto`, `gpu` or `cpu`. */
+  device: string;
+  ok: boolean;
+  /** The adapter as the runtime names itself, e.g. `AMD Radeon(TM) Graphics (spirv_4098_5688)`. */
+  adapter: string | null;
+  /** `vulkan` | `dx12` | `gl` | `cpu`, or `auto` when nothing pinned a backend. */
+  backend: string | null;
+  /** Why it is unusable, in the engine's own words. */
+  reason: string | null;
+  elapsed_ms: number;
+};
+
+/**
+ * Pre-flight a device. Cached by the shell until the app restarts; `refresh` re-runs the probe,
+ * which on a broken driver costs up to 40 s before it answers.
+ */
+export async function probeDevice(device: string, refresh = false): Promise<DeviceReport> {
+  if (!isTauri) {
+    // Preview mode: show a plausible working card so the layout can be judged.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    return {
+      device,
+      ok: true,
+      adapter: "NVIDIA GeForce RTX 4060 (spirv_4098_5688)",
+      backend: "auto",
+      reason: null,
+      elapsed_ms: 1180,
+    };
+  }
+  return await invoke<DeviceReport>("probe_device", { device, refresh });
+}
+
 export async function getSettings(): Promise<SettingsView> {
   if (!isTauri) return SAMPLE_SETTINGS;
   return await invoke<SettingsView>("get_settings");

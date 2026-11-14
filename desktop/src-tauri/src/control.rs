@@ -645,6 +645,24 @@ fn route(request: &Request, runtime: &Runtime, started: Instant) -> Response {
             let since = since_param(request).unwrap_or(0);
             Response::json(200, delta_body(runtime, since, None))
         }
+        // The question every AI client asks first and can only answer by wasting a run: will
+        // training reach epoch one on this machine? Cached, so the first call may take as long as
+        // the probe timeout and later ones are instant. `refresh=1` re-runs it.
+        ("GET", "/device") => {
+            let device = request
+                .query
+                .get("device")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| runtime.settings().default_device);
+            let refresh = request
+                .query
+                .get("refresh")
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+            let report = runtime.probe_device(&device, refresh);
+            Response::json(200, json!({ "ok": true, "probe": report }))
+        }
         ("GET", "/runs") => {
             let limit = request
                 .query
@@ -1183,6 +1201,7 @@ fn guide(runtime: &Runtime) -> String {
 | POST | `/train` | 开始训练 |
 | POST | `/stop` | 中止训练 |
 | POST | `/predict` | 用训练好的模型给一张图推理 |
+| GET | `/device?device=auto` | **训练前先问**：这台机器在这个设备上能不能真的跑起来 |
 | GET | `/datasets/scan?path=...` | 检查一个数据集目录是否可用 |
 | POST | `/datasets/scan` | 同上，但路径放在 JSON body 里（中文路径免 percent-encode） |
 | GET | `/runs` | 列出历史训练与产物（应用重启后找旧模型的唯一途径） |
@@ -1190,6 +1209,13 @@ fn guide(runtime: &Runtime) -> String {
 | POST | `/diagnostics` | 上报一个「没报错但结果不对」的问题，服务端补全环境与日志 |
 | GET | `/settings` | 读配置 |
 | PUT | `/settings` | 改配置（整体替换，缺字段用默认值） |
+
+**`/device` 值得在开跑前先问**：它让引擎在目标设备上真的执行一次矩阵乘、再把结果读回来，
+所以答的是「能不能算」而不是「装了什么卡」。返回 `probe.ok`（能不能用）、`probe.adapter`
+（显卡名）、`probe.backend`（`vulkan` / `dx12` / `gl` / `cpu`，未指定时是 `auto`）、
+`probe.reason`（不能用的原因，引擎原话）、`probe.elapsed_ms`。第一次调用可能要等十几秒
+（打不开的设备不会报错，只会挂到超时），结果在本进程内缓存，加 `?refresh=1` 才重测。
+`probe.ok=false` 不等于不能训练：`device=auto` 会退回 CPU，只是慢。
 
 **`/state` 有两种响应形态**：不带参数时**直接**就是快照对象（`status`/`epoch`/`best` 在顶层）；
 带 `?since=N` 时是 `{{"ok":true,"state":{{...}},"cursor":N,"events":[...]}}`，同样的字段在

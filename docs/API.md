@@ -235,6 +235,30 @@ montgomery export --model <x.bpk> --format onnx --output <x.onnx> \
 按 `settings.engine_path` → `MONTGOMERY_ENGINE` → exe 同目录 → 仓库构建产物 查找。
 配置了却不存在的路径会**直接报错**，不静默回退——否则用户看到"装了却找不到引擎"。
 
+### `probe_device(device, refresh?)` → `DeviceReport`
+
+训练前的预检：让引擎在目标设备上真的执行一次矩阵乘、再把结果读回来。**问的不是"装了什么卡"，
+而是"能不能算"**——驱动可以接受设备创建、然后在第一次 buffer 回读时失败（本项目的开发机就是
+这样），所以只有真跑一个 kernel 才能回答。与第 9.12 节的 `GET /device` 共用实现。
+
+```jsonc
+{
+  "device": "auto",                                   // 调用方问的设备
+  "ok": true,                                         // false = 跑不起来，不等于"没有显卡"
+  "adapter": "AMD Radeon(TM) Graphics (spirv_4098_5688)",  // 运行时自报的名字（含编译指纹）
+  "backend": "auto",                                  // vulkan | dx12 | gl | cpu | auto
+  "reason": null,                                     // 失败时是引擎原话，已截断到 300 字
+  "elapsed_ms": 1180
+}
+```
+
+- `backend` 在没人为指定后端时是 `"auto"`：运行时自己选，且不自报选了哪个。**不要把这个值
+  猜成 `vulkan`**，同一个指纹 `spirv_*` 在 Vulkan 与 DX12 的 SPIR-V 路径下都会出现。
+- 结果在壳内**按设备缓存到进程退出**，`refresh: true` 才重测。坏驱动上首次探测要等到超时
+  （40 秒），所以界面进页面即可调用、不必担心重复开进程。
+- `reason` 的取值来自 stderr：干净失败是 `error [CODE]: …`，崩溃是 panic 帧**下一行**的消息
+  （帧本身只有源码位置，对用户没用）。
+
 ### `predict_image(request: PredictRequest)` → `PredictResult`
 
 与第 9.6 节的 `POST /predict` **共用同一个实现**（`src-tauri/src/predict.rs`），字段一致，
@@ -299,6 +323,7 @@ Python**：安装包里带了每个架构的无权重骨架（`resources/onnx/<m
 | POST | `/predict` | 用训练好的模型推理一张图 | 200 |
 | GET | `/datasets/scan?path=...` | 校验数据集目录 | 200 |
 | POST | `/datasets/scan` | 同上，路径放 JSON body（免 percent-encode） | 200 |
+| GET | `/device?device=auto` | **训练前预检**：该设备能否真的跑起来（见 9.12） | 200 |
 | GET | `/runs` | 历史运行与可用产物（重启后找旧模型的唯一途径） | 200 |
 | GET | `/diagnostics?limit=N` | 本机诊断报告列表 | 200 |
 | POST | `/diagnostics` | 上报「没报错但结果不对」的问题 | 202 |
@@ -646,6 +671,25 @@ panic、ONNX 形状不匹配的证据就永久消失，用户只能说「它失�
 
 `/predict` 不走常驻引擎进程，它的一次性 stderr 直接进错误的 `error` 字段，因此预测失败的
 报告里「日志尾部」可能是空的，但「发生了什么」那段就是引擎原文。
+
+### 9.12 `GET /device?device=auto&refresh=0`
+
+训练前的预检，回答「这台机器在这个设备上能不能真的跑起来」。字段与第 8 节的
+`probe_device` 完全一致，外面包一层：
+
+```jsonc
+{"ok": true, "probe": {"device": "gpu", "ok": false, "adapter": null, "backend": "auto",
+                       "reason": "Failed to map buffer: BufferAsyncError", "elapsed_ms": 6120}}
+```
+
+注意两个 `ok` 不是一回事：外层是**请求**成功，`probe.ok` 是**设备**可用。
+
+- 不传 `device` 时用 `settings.default_device`；`refresh=1` 或 `refresh=true` 丢弃缓存重测。
+- **第一次调用可能很慢**：设备创建失败时不会立刻报错，而是挂到 40 秒超时。客户端超时请设到
+  45 秒以上，或者只在需要时调用一次。结果按设备缓存到进程退出。
+- `probe.ok=false` **不等于不能训练**：`device=auto` 会退回 CPU。它的意思是「别指望这张卡，
+  要么换 `cpu`，要么接受慢」。
+- 该接口不写诊断报告、不推送。它只回答问题。
 
 ---
 

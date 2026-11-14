@@ -105,3 +105,51 @@ pretrained transfer differed outside the documented class projections:
 - 修复前：`--model yolov8n.bpk` 直接失败
 - 修复后：`Initialized 291 tensors ... freshly initialized 6 class-projection tensors and 6
   classification-tower tensors`，mAP 3.22%，对照"从零"为 0.013%
+
+## 0006 · 探针的 JSON 输出 + `lib.rs` 设备选择（补上此前漏掉的补丁）
+
+两件事，第二件是补债。
+
+### (a) `__device-probe --json`
+
+壳要在训练前回答「这台机器能不能跑」，就必须拿到 adapter 名字和 backend，而不能靠解析
+`Device probe: AMD Radeon(TM) Graphics (spirv_4098_5688) ok (sum 32768)` 这种句子——
+显卡名里本身带括号，没有可靠的切分点。
+
+`--json` 打一行：
+
+```json
+{"ok":true,"device":"gpu","backend":"dx12","adapter":"AMD Radeon(TM) Graphics (spirv_4098_5688)","sum":32768.0}
+```
+
+干净失败（`total` 不对）也打一行 `ok:false` 再返回非零。**崩溃（panic）路径打不出来**——
+这是设计如此：这条命令存在的意义就是在子进程里崩，父进程只看退出码和输出，`reason` 从
+stderr 里取（panic 帧的下一行）。
+
+`backend` 在没人用 `MONTGOMERY_WGPU_BACKEND` 指定时是 `"auto"`：运行时自己选后端且不自报，
+`spirv_*` 这个指纹在 Vulkan 和 DX12 的 SPIR-V 路径下都会出现，**不能拿它猜**。
+
+### (b) `src/lib.rs`：`wgpu_device_from_env()` 与 `default_wgpu_device()`
+
+这两个函数是更早一轮做设备探查时加的，**当时没出补丁**（和 0005(a) 同一类漏）。后果是：
+按上面的步骤重建，得到的引擎没有 `--device auto` 的后端钩子，也拿不到 adapter 描述，
+`0006(a)` 的 `--json` 会因为找不到函数而编译失败。所以两者放在同一个补丁里。
+
+`default_wgpu_device()` 每次返回同一对 `(Device, String)`（`OnceLock`）：第一次调用打开设备，
+这一步就是运行时启动耗时的主要来源。描述串是 `名字 (编译指纹)`，指纹原样来自
+`compilation_store`，不是重算的。
+
+### 应用顺序与当前的坑
+
+**必须最后应用**，且与 0004 一起时要用 `--3way`：
+
+```bash
+git apply --3way ../../patches/0001-*.patch   # 0001 与 0004 都改 export/mod.rs
+git apply --3way ../../patches/0004-*.patch   # 两者 hunk 位置重叠，普通 apply 会失败
+git apply ../../patches/0006-*.patch
+```
+
+`0001` 与 `0004` 都在 `ExportSpec::for_model` 附近落 hunk，按 `*.patch` 通配顺序（0001 先）
+普通 `git apply` 会在 0004 处报 `patch does not apply`；`--3way` 会在 `export/mod.rs` 留下
+冲突标记（`UU`），**需要人工合并那一处**。这套补丁目前不能一条命令重建，属于已知缺陷，
+未修——修它要把 0001–0005 重新按当前基线导出，风险大于收益，等下一次必须重建引擎时一起做。

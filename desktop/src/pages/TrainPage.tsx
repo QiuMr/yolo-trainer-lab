@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import {
   Boxes,
+  CircleCheck,
   CopyPlus,
   Cpu,
   Download,
@@ -10,6 +11,7 @@ import {
   Layers,
   Play,
   Plus,
+  RefreshCw,
   Sparkles,
   TriangleAlert,
   Wand2,
@@ -23,7 +25,9 @@ import {
   pickFolder,
   pickModelFile,
   pretrainedCatalog,
+  probeDevice,
   startTraining,
+  type DeviceReport,
   type PretrainedProgress,
   type PretrainedWeight,
   type TrainInit,
@@ -38,6 +42,23 @@ import {
   type TaskId,
 } from "../lib/models";
 import { resetRun, setState, useAppState } from "../lib/store";
+
+/** Human label for a backend id. `auto` says so rather than guessing: the runtime picks a backend
+ *  and does not report which one, and naming one would be a false statement about the user's own
+ *  machine. */
+const BACKEND_LABEL: Record<string, string> = {
+  vulkan: "Vulkan",
+  dx12: "DX12",
+  gl: "OpenGL",
+  cpu: "CPU",
+  auto: "后端由运行时选择",
+};
+
+/** `AMD Radeon(TM) Graphics (spirv_4098_5688)` → `AMD Radeon(TM) Graphics`. The parenthesised part
+ *  is a compilation fingerprint — noise in a status row, useful in a tooltip. */
+function adapterName(adapter: string): string {
+  return adapter.replace(/\s*\([^()]*\)\s*$/, "");
+}
 
 const DEVICES = [
   { id: "auto", label: "自动", icon: Sparkles, note: "探测显卡，失败退回 CPU" },
@@ -145,6 +166,9 @@ export default function TrainPage({
   /** Resume source: a `checkpoints/last` directory, not a `.bpk`. */
   const [checkpointPath, setCheckpointPath] = useState<string | null>(null);
   const [device, setDevice] = useState<string>(defaultDevice);
+  /** What the engine said about the selected device, and whether the question is in flight. */
+  const [probe, setProbe] = useState<DeviceReport | null>(null);
+  const [probing, setProbing] = useState(false);
   const [epochs, setEpochs] = useState("100");
   const [batch, setBatch] = useState("8");
   const [imgsz, setImgsz] = useState("640");
@@ -189,6 +213,29 @@ export default function TrainPage({
   useEffect(() => {
     if (!imgszEdited) setImgsz(String(taskImageSize));
   }, [taskImageSize, imgszEdited]);
+
+  // Ask the engine whether the selected device can actually compute, before a run is committed to
+  // it. Re-asked per device, cached in the shell afterwards: on a broken driver the probe costs the
+  // full timeout to say no, and a page that re-asked on every render would stack those up.
+  useEffect(() => {
+    let alive = true;
+    setProbing(true);
+    void probeDevice(device)
+      .then((report) => {
+        if (alive) setProbe(report);
+      })
+      .catch(() => {
+        // An unreachable engine is already reported when training starts; a failed pre-flight must
+        // not turn into a page-level error the user cannot dismiss.
+        if (alive) setProbe(null);
+      })
+      .finally(() => {
+        if (alive) setProbing(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [device]);
 
   // Validation lives here, not in each field: the start button is the only thing that
   // actually needs a yes/no, and a field cannot know whether a half-typed value matters.
@@ -265,7 +312,9 @@ export default function TrainPage({
         init = { mode: "resume", checkpoint: checkpointPath ?? "" };
       }
       resetRun();
-      setState({ status: "running" });
+      // The task rides along so the monitor can name the validation number: mAP for detection and
+      // segmentation, accuracy for classification.
+      setState({ status: "running", task: taskId });
       await startTraining({
         init,
         // Resume reads its dataset from the checkpoint; sending one would be ignored at best and
@@ -701,6 +750,65 @@ export default function TrainPage({
               </button>
             );
           })}
+        </div>
+
+        {/* The pre-flight answer. "Will it train" is not "which card is installed": a driver can
+            accept a device and then fail the first readback, which is exactly what happens on the
+            machine this project was developed on. Saying "无需安装 CUDA" here is worth the pixels —
+            it is the question every PyTorch user arrives with. */}
+        <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1.5 border-t border-line pt-3">
+          {probing ? (
+            <span className="text-[12px] font-medium text-ink-faint">
+              正在检测这台机器的计算设备…
+            </span>
+          ) : probe?.ok ? (
+            <>
+              <CircleCheck size={13} strokeWidth={2.8} className="shrink-0 text-ok" />
+              <span
+                className="text-[12px] font-semibold text-ink"
+                title={probe.adapter ?? undefined}
+              >
+                {probe.adapter ? adapterName(probe.adapter) : "图形设备"}
+              </span>
+              <span className="text-[12px] font-medium text-ink-faint">
+                · {BACKEND_LABEL[probe.backend ?? "auto"] ?? probe.backend}
+                {probe.backend === "cpu" ? "" : " · 无需安装 CUDA"}
+              </span>
+            </>
+          ) : probe ? (
+            <>
+              <TriangleAlert size={13} strokeWidth={2.6} className="shrink-0 text-danger" />
+              <span className="text-[12px] font-semibold text-ink">
+                {device === "cpu" ? "CPU 不可用" : "显卡跑不起来"}
+              </span>
+              <span
+                className="min-w-0 flex-1 truncate text-[12px] font-medium text-ink-faint"
+                title={probe.reason ?? undefined}
+              >
+                {probe.reason ?? "引擎没有给出原因"}
+                {device === "auto" ? "（自动模式会退回 CPU）" : ""}
+              </span>
+            </>
+          ) : null}
+          <button
+            type="button"
+            disabled={probing}
+            onClick={() => {
+              setProbing(true);
+              void probeDevice(device, true)
+                .then(setProbe)
+                .catch(() => setProbe(null))
+                .finally(() => setProbing(false));
+            }}
+            className="press ml-auto flex shrink-0 items-center gap-1 rounded-[7px] px-2 py-1 text-[11.5px] font-bold text-ink-faint transition-colors duration-120 hover:bg-surface-sunken hover:text-ink disabled:opacity-50"
+          >
+            <RefreshCw
+              size={11}
+              strokeWidth={2.6}
+              className={probing ? "animate-spin" : undefined}
+            />
+            重新检测
+          </button>
         </div>
       </Card>
 

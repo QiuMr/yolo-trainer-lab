@@ -5,6 +5,7 @@ import {
   CircleStop,
   Clock,
   CircleCheck,
+  Gauge,
   LineChart,
   ScrollText,
   Target,
@@ -119,6 +120,16 @@ export default function MonitorPage() {
 
   const copy = state.error ? ERROR_COPY[state.error.code] ?? ERROR_COPY.INTERNAL : null;
 
+  // Named per task: detection and segmentation report COCO mAP50-95, classification reports
+  // top-1 accuracy, and labelling one with the other's name would be a wrong number under a
+  // right-looking label. Unknown when the page was opened mid-run from a fresh process.
+  const fitnessLabel =
+    state.task === "classify"
+      ? "验证准确率"
+      : state.task === "detect" || state.task === "segment"
+        ? "验证 mAP50-95"
+        : "验证指标";
+
   return (
     <div>
       <div className="flex items-start justify-between gap-6">
@@ -176,7 +187,7 @@ export default function MonitorPage() {
         </div>
       ) : null}
 
-      <div className="mt-8 grid grid-cols-4 gap-4">
+      <div className="mt-8 grid grid-cols-5 gap-4">
         <Stat
           label="进度"
           value={
@@ -199,6 +210,16 @@ export default function MonitorPage() {
           icon={TrendingDown}
           enter={1}
         />
+        {/* The number that actually says whether the model is any good. Loss keeps falling on a
+            model that memorised four images, so it cannot answer that question on its own. */}
+        <Stat
+          label={fitnessLabel}
+          value={state.lastFitness}
+          digits={3}
+          placeholder="—"
+          icon={Gauge}
+          enter={2}
+        />
         <Stat
           label="单轮耗时"
           value={state.lastEpochSeconds}
@@ -206,14 +227,14 @@ export default function MonitorPage() {
           // A unit next to a dash reads as "— 秒", which parses as a value that does not exist.
           unit={state.lastEpochSeconds === null ? undefined : "秒"}
           icon={Clock}
-          enter={2}
+          enter={3}
         />
         <Stat
           label="预计剩余"
           value={remaining}
           unit={remaining === null ? undefined : "秒"}
           icon={Clock}
-          enter={3}
+          enter={4}
         />
       </div>
 

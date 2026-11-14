@@ -1,0 +1,143 @@
+diff --git a/src/main.rs b/src/main.rs
+index 8a1fc35..d3576d0 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -257,6 +257,11 @@ struct DeviceProbeArgs {
+     /// Backend to exercise: `gpu` (whatever the runtime settles on) or `cpu`.
+     #[arg(long, value_enum)]
+     device: DeviceProbeTarget,
++    /// Print one machine-readable line instead of the human one. A front end needs the adapter
++    /// name, not a sentence: it cannot parse `Device probe: X (y) ok (sum 32768)` back into fields
++    /// without guessing where the name ends.
++    #[arg(long)]
++    json: bool,
+ }
+ 
+ #[cfg(feature = "training")]
+@@ -266,6 +271,16 @@ enum DeviceProbeTarget {
+     Cpu,
+ }
+ 
++#[cfg(feature = "training")]
++impl DeviceProbeTarget {
++    /// The same spelling clap accepts, so the JSON and the command line cannot drift.
++    fn as_str(self) -> &'static str {
++        match self {
++            Self::Gpu => "gpu",
++            Self::Cpu => "cpu",
++        }
++    }
++}
+ 
+ #[cfg(feature = "onnx")]
+ #[derive(Debug, ClapArgs)]
+@@ -726,16 +741,51 @@ fn run_device_probe(args: DeviceProbeArgs) -> montgomery::Result<()> {
+         DeviceProbeTarget::Gpu => montgomery::default_wgpu_device(),
+     };
+ 
++    // `auto` is the honest answer when nothing pinned a backend: the runtime chooses one and the
++    // device identity does not name it (its `fingerprint` is a compilation target such as
++    // `spirv_4098_5688`, which is the same string under Vulkan and under DX12's SPIR-V path).
++    // Reporting a guess here would tell a user the wrong thing about their own machine.
++    let backend = match args.device {
++        DeviceProbeTarget::Cpu => "cpu".to_owned(),
++        DeviceProbeTarget::Gpu => std::env::var("MONTGOMERY_WGPU_BACKEND")
++            .ok()
++            .map(|value| value.trim().to_ascii_lowercase())
++            .filter(|value| !value.is_empty())
++            .unwrap_or_else(|| "auto".to_owned()),
++    };
++
+     let ones = Tensor::<2>::zeros([32, 32], &device) + 1.0;
+     let product = ones.clone().matmul(ones);
+     let total: f32 = product.sum().into_scalar::<f32>().elem();
+ 
+     const EXPECTED: f32 = 32.0 * 32.0 * 32.0;
+     if !total.is_finite() || (total - EXPECTED).abs() > 1e-3 {
+-        return Err(format!(
+-            "device probe produced {total}, expected {EXPECTED} ({adapter})"
+-        )
+-        .into());
++        let detail = format!("device probe produced {total}, expected {EXPECTED} ({adapter})");
++        if args.json {
++            println!(
++                "{}",
++                serde_json::json!({
++                    "ok": false,
++                    "device": args.device.as_str(),
++                    "backend": backend,
++                    "adapter": adapter,
++                    "error": detail,
++                })
++            );
++        }
++        return Err(detail.into());
++    }
++    if args.json {
++        println!(
++            "{}",
++            serde_json::json!({
++                "ok": true,
++                "device": args.device.as_str(),
++                "backend": backend,
++                "adapter": adapter,
++                "sum": total as f64,
++            })
++        );
+     }
+     eprintln!("Device probe: {adapter} ok (sum {total})");
+     Ok(())
+diff --git a/src/lib.rs b/src/lib.rs
+index 319275c..66a3e6d 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -19,9 +19,6 @@ extern crate alloc;
+ pub use burn::optim::{RecordState, StateSink, StateSource, join_path};
+ 
+ mod data;
+-/// Dataset inspection and offline transformations, independent of model execution.
+-#[cfg(feature = "pretrained")]
+-pub mod dataset;
+ #[cfg(feature = "onnx")]
+ pub mod export;
+ pub mod models;
+@@ -3471,6 +3468,29 @@ pub(crate) fn end2end_topk_detections(
+     batches
+ }
+ 
++/// Local experiment hook: pin the graphics API instead of letting `Auto` settle on one.
++///
++/// `MONTGOMERY_WGPU_BACKEND=dx12|vulkan|gl` pins that API; anything else keeps Burn's default
++/// (`Auto`, which prefers Vulkan on Windows). This exists because cubecl picks device-side
++/// timestamp queries from the adapter's *advertised* `TIMESTAMP_QUERY` support, and a driver that
++/// advertises it without being able to map the readback poisons the device mid-run.
++#[cfg(feature = "gpu")]
++fn wgpu_device_from_env() -> burn::tensor::Device {
++    use burn::tensor::{Device, DeviceKind};
++    use burn_wgpu::{WgpuBackend, WgpuDevice};
++
++    let pinned = std::env::var("MONTGOMERY_WGPU_BACKEND").unwrap_or_default();
++    match pinned.trim().to_ascii_lowercase().as_str() {
++        "dx12" => Device::new(WgpuDevice::default().on(WgpuBackend::Dx12)),
++        "vulkan" => Device::new(WgpuDevice::default().on(WgpuBackend::Vulkan)),
++        "gl" => Device::new(WgpuDevice::default().on(WgpuBackend::Gl)),
++        // Diagnostics only: lets the trainer run its data -> forward -> loss -> backward path
++        // on the CPU when the machine's GPU cannot hold a device.
++        "cpu" => Device::flex(),
++        _ => Device::wgpu(DeviceKind::DefaultDevice),
++    }
++}
++
+ /// Resolve the default wgpu device and describe the adapter behind it.
+ ///
+ /// The first call opens the device, which runs wgpu adapter selection and device creation, so
+@@ -3486,7 +3506,8 @@ pub fn default_wgpu_device() -> (burn::tensor::Device, String) {
+     static DEVICE: OnceLock<(Device, String)> = OnceLock::new();
+     DEVICE
+         .get_or_init(|| {
+-            let device = Device::wgpu(DeviceKind::DefaultDevice);
++            let _ = DeviceKind::DefaultDevice;
++            let device = wgpu_device_from_env();
+             let description = device.identity().map_or_else(
+                 || format!("{device:?}"),
+                 |identity| format!("{} ({})", identity.name, identity.fingerprint),

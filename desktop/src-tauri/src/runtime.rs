@@ -83,6 +83,9 @@ struct Inner {
     /// event and then an `exit` event, and both leave `status = failed`; without this a single
     /// crash would file two reports and burn two of the three pushes allowed per minute.
     reported_failure: Mutex<Option<String>>,
+    /// Device probes already answered, keyed by the requested device. A probe opens a device and
+    /// can take the full timeout to say no, so re-asking on every render would stack up children.
+    probes: Mutex<std::collections::HashMap<String, crate::engine::DeviceReport>>,
 }
 
 #[derive(Clone)]
@@ -151,6 +154,7 @@ impl Runtime {
             control: Mutex::new(ControlInfo::default()),
             control_handle: Mutex::new(None),
             reported_failure: Mutex::new(None),
+            probes: Mutex::new(std::collections::HashMap::new()),
         }));
 
         // Fold engine messages here, not in the Tauri setup. The hub fans out to every subscriber
@@ -397,6 +401,37 @@ impl Runtime {
     /// Where failure reports are written.
     pub fn diagnostics_root(&self) -> PathBuf {
         self.0.data_dir.join("diagnostics")
+    }
+
+    /// Ask the engine whether `device` can run a kernel and read the result back.
+    ///
+    /// This is the only honest answer to "will training work on this machine". Windows will report
+    /// an adapter that wgpu opens happily and that then dies on the first readback — the reference
+    /// machine for this project does exactly that — so nothing short of executing a kernel settles
+    /// it. Cached per device for the process' lifetime because the answer costs a child process
+    /// (and, on a broken driver, the full probe timeout); `refresh` is what the UI's button uses.
+    pub fn probe_device(&self, device: &str, refresh: bool) -> crate::engine::DeviceReport {
+        if !refresh {
+            if let Ok(cache) = self.0.probes.lock() {
+                if let Some(report) = cache.get(device) {
+                    return report.clone();
+                }
+            }
+        }
+        let report = match crate::engine::resolve(self.settings().engine_path.as_deref()) {
+            Ok(path) => crate::engine::probe(&path, device),
+            // A missing engine is a real answer for this question: nothing can train without it.
+            Err(error) => crate::engine::DeviceReport {
+                device: device.to_owned(),
+                ok: false,
+                reason: Some(error),
+                ..crate::engine::DeviceReport::default()
+            },
+        };
+        if let Ok(mut cache) = self.0.probes.lock() {
+            cache.insert(device.to_owned(), report.clone());
+        }
+        report
     }
 
     /// Everything a maintainer needs to judge a report without asking a follow-up question.

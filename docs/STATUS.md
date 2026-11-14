@@ -6,6 +6,20 @@
 桌面壳、AI 操控接口、45 个模型选择器、分类链路、单图推理都已闭环；本轮补上 GitHub 仓库、
 版本管理与自动更新。GPU 后端在这台机器上不可靠，需换独显机器验证。
 
+## 训练前设备预检（2026-11-14）
+
+把「这台机器能不能训」从「跑一次失败才知道」变成开跑前就能问。
+
+| 入口 | 形态 | 实测 |
+| --- | --- | --- |
+| 引擎 | `montgomery __device-probe --device gpu --json` | 本机 Vulkan: 崩溃无 JSON（exit 101）；DX12: `ok:true, adapter:"AMD Radeon(TM) Graphics (spirv_4098_5688)"` |
+| 壳 | `probe_device(device, refresh?)` 命令 | 真实引擎 `--ignored` 测试通过；旧引擎走无 `--json` 重试路径也通过 |
+| HTTP | `GET /device?device=auto&refresh=0` | 与命令同一实现 |
+| 界面 | 训练页「计算设备」卡片下一行 + 重新检测按钮 | 类型检查通过，未跑真机 UI 截图 |
+
+已知边界：`backend` 在没人为指定时是 `auto`，因为运行时不自报选了哪个后端；设备创建失败时会
+挂到 40 秒超时才回答，所以 HTTP 客户端超时要比 40 秒长。
+
 ## 训练源码审计与引擎修正（2026-11-14）
 
 审了 `research/montgomery` 的整条训练链路（47,643 行 / 124 文件）。作者仍在活跃开发——

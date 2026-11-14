@@ -21,6 +21,11 @@ export type LogLine = {
 
 export type AppState = {
   dataset: DatasetSummary | null;
+  /** `detect` | `segment` | `classify`, set by the page that started the run. The monitor needs it
+   *  to name the validation number correctly: detection and segmentation report mAP, classification
+   *  reports accuracy, and calling one the other would be a wrong number under a right-looking
+   *  label. */
+  task: string | null;
   /** Lifecycle of the current run, driven purely by engine events. */
   status: "idle" | "running" | "done" | "failed";
   backend: string | null;
@@ -30,6 +35,10 @@ export type AppState = {
   epoch: number;
   losses: Array<[number, number]>;
   lastLoss: number | null;
+  /** Validation fitness from the last epoch (detection: mAP). The only number that says whether the
+   *  model is any good — loss falls on a model that memorised four images. `null` under `--no-val`,
+   *  which must read as "not measured" rather than as zero. */
+  lastFitness: number | null;
   lastEpochSeconds: number | null;
   best: string | null;
   error: { code: string; message: string; hint: string | null } | null;
@@ -38,6 +47,7 @@ export type AppState = {
 
 const EMPTY: AppState = {
   dataset: null,
+  task: null,
   status: "idle",
   backend: null,
   adapter: null,
@@ -46,6 +56,7 @@ const EMPTY: AppState = {
   epoch: 0,
   losses: [],
   lastLoss: null,
+  lastFitness: null,
   lastEpochSeconds: null,
   best: null,
   error: null,
@@ -74,6 +85,7 @@ export function resetRun() {
   state = {
     ...state,
     status: "idle",
+    task: null,
     backend: null,
     adapter: null,
     runDir: null,
@@ -81,6 +93,7 @@ export function resetRun() {
     epoch: 0,
     losses: [],
     lastLoss: null,
+    lastFitness: null,
     lastEpochSeconds: null,
     best: null,
     error: null,
@@ -118,6 +131,7 @@ export function applyEvent(event: EngineEvent) {
         epoch: 0,
         losses: [],
         lastLoss: null,
+        lastFitness: null,
         best: null,
         error: null,
       });
@@ -135,6 +149,7 @@ export function applyEvent(event: EngineEvent) {
         totalEpochs: event.epochs,
         losses: [...prev.losses, [event.epoch, event.loss]],
         lastLoss: event.loss,
+        lastFitness: event.fitness,
         lastEpochSeconds: event.elapsed_s,
       }));
       pushLog(

@@ -61,6 +61,21 @@ async fn check_update(app: tauri::AppHandle) -> updater::UpdateInfo {
     updater::check(&app).await
 }
 
+/// Pre-flight: can this machine actually train on `device`?
+///
+/// Asked before a run, not after one fails. The answer is cached in the shell, so the training page
+/// can ask on mount and the "重新检测" button passes `refresh: true`. Blocking on purpose, like
+/// `predict_image`: opening a device is a one-shot cost of about a second, and a synchronous
+/// command runs off the UI thread.
+#[tauri::command]
+fn probe_device(
+    runtime: State<'_, Runtime>,
+    device: String,
+    refresh: Option<bool>,
+) -> engine::DeviceReport {
+    runtime.probe_device(&device, refresh.unwrap_or(false))
+}
+
 /// On Windows this does not return on success: the updater launches the NSIS installer and exits.
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
@@ -227,6 +242,7 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![
             resolve_engine,
+            probe_device,
             scan_dataset,
             start_training,
             stop_training,

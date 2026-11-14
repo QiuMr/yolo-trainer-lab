@@ -9,11 +9,12 @@
 //! verbatim; the shell only ever *adds* the `exit` event, because a process cannot report its own
 //! exit code.
 
-use std::io::{BufRead, BufReader, Write as _};
+use std::io::{BufRead, BufReader, Read, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// One rollover point. Engine stderr is a few hundred lines per run, so 8 MiB holds many runs;
 /// the number is only here so a pathological run cannot fill the disk.
@@ -320,6 +321,233 @@ pub enum Message {
     Event(Value),
     /// A human line: stderr, or stdout that was not JSON.
     Log(String),
+}
+
+/// What asking the engine "can this device actually compute?" produced.
+///
+/// The distinction the UI has to make is not "which GPU is installed" — Windows answers that — but
+/// "will a training run reach the first epoch on it". Those differ: this project's own reference
+/// machine has an adapter that Windows reports happily, that wgpu opens, and that dies on the first
+/// buffer readback. Only executing a kernel and reading the answer back settles it, which is what
+/// `__device-probe` does in a child process so a poisoned driver cannot take the app with it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DeviceReport {
+    /// What the caller asked for: `auto`, `gpu` or `cpu`.
+    pub device: String,
+    pub ok: bool,
+    /// The adapter as the runtime names itself, e.g. `AMD Radeon(TM) Graphics (spirv_4098_5688)`.
+    pub adapter: Option<String>,
+    /// `vulkan` | `dx12` | `gl` | `cpu`, or `auto` when nothing pinned a backend — the runtime
+    /// picks one and does not report which, and inventing an answer here would tell a user
+    /// something false about their own machine.
+    pub backend: Option<String>,
+    /// Why it is not usable, in the engine's own words. Clamped, because a panic backtrace is
+    /// thousands of characters and the UI has one line for it.
+    pub reason: Option<String>,
+    pub elapsed_ms: u64,
+}
+
+/// How long a probe may take. Opening a device is the step that hangs instead of failing on a bad
+/// driver, and it hangs before writing anything, so there is nothing to poll on — only a deadline.
+/// A working adapter answers in about a second; a wedged one never answers.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(40);
+
+/// Ask the engine whether `device` can run one kernel and read the result back.
+///
+/// Runs in a child process on purpose (see `__device-probe` in the engine): the failure mode being
+/// detected poisons the device and takes the process down with a panic, which nothing in-process can
+/// survive. The parent only reads an exit status and a line of output.
+pub fn probe(engine: &Path, device: &str) -> DeviceReport {
+    // `auto` asks the GPU question, because that is the branch `auto` will take if the answer is
+    // yes; the CPU fallback is the shell's own guarantee and needs no probe.
+    let target = if device.eq_ignore_ascii_case("cpu") {
+        "cpu"
+    } else {
+        "gpu"
+    };
+    let started = Instant::now();
+    let mut report = probe_once(engine, target, true);
+    // An engine older than the `--json` flag rejects the argument, and clap's rejection is
+    // indistinguishable from a real failure without looking for it. Retry once without it so a
+    // packaged engine from before this change still answers — the human line carries the adapter
+    // too, just less conveniently.
+    if report
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("--json"))
+    {
+        report = probe_once(engine, target, false);
+    }
+    report.device = device.to_owned();
+    report.elapsed_ms = started.elapsed().as_millis() as u64;
+    report
+}
+
+fn probe_once(engine: &Path, target: &str, json: bool) -> DeviceReport {
+    let mut command = hidden_command(engine);
+    command.arg("__device-probe").arg("--device").arg(target);
+    if json {
+        command.arg("--json");
+    }
+    command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return DeviceReport {
+                ok: false,
+                reason: Some(format!("引擎无法启动：{error}")),
+                ..DeviceReport::default()
+            }
+        }
+    };
+    // Drain both pipes on their own threads before waiting. An engine that panics writes a
+    // backtrace, and a full pipe blocks the child — which would turn "crashed" into "timed out".
+    let stdout = child.stdout.take().map(drain);
+    let stderr = child.stderr.take().map(drain);
+
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                timed_out = true;
+                break None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(40)),
+            Err(_) => {
+                let _ = child.kill();
+                break None;
+            }
+        }
+    };
+    let out = stdout.and_then(|handle| handle.join().ok()).unwrap_or_default();
+    let err = stderr.and_then(|handle| handle.join().ok()).unwrap_or_default();
+
+    // The engine prints exactly one JSON line, so take the last parseable one: a stray warning on
+    // stdout before it must not shadow the answer.
+    let parsed = out
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .filter(|value| value.get("ok").and_then(Value::as_bool).is_some())
+        .next_back();
+    if let Some(value) = parsed {
+        let ok = value["ok"].as_bool().unwrap_or(false);
+        return DeviceReport {
+            ok,
+            adapter: text(&value, "adapter"),
+            backend: text(&value, "backend"),
+            reason: if ok {
+                None
+            } else {
+                text(&value, "error").or_else(|| Some(explain(&err, timed_out, status)))
+            },
+            ..DeviceReport::default()
+        };
+    }
+
+    // No JSON: a panic before the line could be printed, or an engine that predates the flag. The
+    // exit status is then the only verdict, and the adapter comes from the human line.
+    let succeeded = status.is_some_and(|status| status.success());
+    DeviceReport {
+        ok: succeeded,
+        adapter: if succeeded {
+            stderr_adapter(&err)
+        } else {
+            None
+        },
+        // `cpu` is known even on the legacy path: it is what was asked for and what the engine
+        // reported. A GPU's backend stays unknown rather than being guessed.
+        backend: (target == "cpu").then(|| "cpu".to_owned()),
+        reason: if succeeded {
+            None
+        } else {
+            Some(explain(&err, timed_out, status))
+        },
+        ..DeviceReport::default()
+    }
+}
+
+fn drain(mut stream: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buffer = String::new();
+        let _ = stream.read_to_string(&mut buffer);
+        buffer
+    })
+}
+
+fn text(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Turn a failed probe's stderr into the one line a user can act on.
+///
+/// A panic's message is on the line *after* its `panicked at …` frame, so a reader that only keeps
+/// lines matching a pattern gets the frame and loses the reason. The clean-failure path is simpler:
+/// the engine prints `error [CODE]: message`.
+fn explain(stderr: &str, timed_out: bool, status: Option<std::process::ExitStatus>) -> String {
+    if timed_out {
+        return format!(
+            "探测 {} 秒没有返回，按显卡不可用处理（驱动卡住时不会报错，只会挂住）",
+            PROBE_TIMEOUT.as_secs()
+        );
+    }
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if let Some(line) = lines.iter().find(|line| line.starts_with("error [")) {
+        return clamp(line);
+    }
+    // clap's usage error is `error: unexpected argument '--json' found`, then a blank line, then a
+    // usage block ending in "For more information, try '--help'." Keeping the last line would tell
+    // the user to read the help text and nothing about what was wrong.
+    if let Some(line) = lines.iter().find(|line| line.starts_with("error:")) {
+        return clamp(line);
+    }
+    if let Some(index) = lines.iter().position(|line| line.contains("panicked at")) {
+        if let Some(message) = lines.get(index + 1) {
+            return clamp(message);
+        }
+        return clamp(lines[index]);
+    }
+    if let Some(line) = lines.last() {
+        return clamp(line);
+    }
+    match status {
+        Some(status) => format!("引擎退出码 {}", status.code().unwrap_or(-1)),
+        None => "引擎没有返回任何信息".to_owned(),
+    }
+}
+
+/// The `Device probe: <adapter> ok (sum N)` line, for engines that predate `--json`.
+fn stderr_adapter(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("Device probe: ")?;
+            Some(rest.split(" ok (").next().unwrap_or(rest).trim().to_owned())
+        })
+        .filter(|name| !name.is_empty())
+}
+
+fn clamp(line: &str) -> String {
+    // Enough to identify the failure, short enough for a one-line status row. The full text stays
+    // in the engine log, which is what the diagnostic report attaches.
+    const LIMIT: usize = 300;
+    if line.chars().count() <= LIMIT {
+        return line.to_owned();
+    }
+    let mut clamped: String = line.chars().take(LIMIT).collect();
+    clamped.push('…');
+    clamped
 }
 
 /// Fan-out of engine output: one publisher (the reader threads), N subscribers added at runtime.
@@ -663,6 +891,61 @@ mod tests {
         assert!(error.contains("不存在"), "unexpected message: {error}");
     }
 
+    /// The engine puts a panic's reason on the line *after* its `panicked at …` frame. Keeping only
+    /// the frame would show the user a source location and nothing about what went wrong.
+    #[test]
+    fn a_panic_reason_is_the_message_under_the_frame() {
+        let stderr = "thread 'DSD-4-0' panicked at cubecl-wgpu/src/compute/timings.rs:510:22:\n\
+                      Failed to map buffer: BufferAsyncError\n\n\
+                      thread 'main' panicked at src/main.rs:730:36:\n\
+                      Error while reading data: the device is poisoned\n";
+        let reason = explain(stderr, false, None);
+        assert_eq!(reason, "Failed to map buffer: BufferAsyncError", "{reason}");
+    }
+
+    /// A clean failure is the easier case and must not be shadowed by the panic rule.
+    #[test]
+    fn a_clean_failure_uses_the_error_line() {
+        let stderr = "error [DEVICE_UNAVAILABLE]: no compatible GPU adapter\nhint: use --device cpu\n";
+        assert_eq!(
+            explain(stderr, false, None),
+            "error [DEVICE_UNAVAILABLE]: no compatible GPU adapter"
+        );
+    }
+
+    /// A wedged driver prints nothing at all, so the deadline is the only signal. Saying "退出码"
+    /// here would suggest the engine had a verdict when it never spoke.
+    #[test]
+    fn a_silent_timeout_says_so_instead_of_inventing_an_exit_code() {
+        let reason = explain("", true, None);
+        assert!(reason.contains("没有返回"), "{reason}");
+        assert!(!reason.contains("退出码"), "{reason}");
+    }
+
+    /// Old packaged engines answer with this line instead of JSON; the adapter is still in it.
+    #[test]
+    fn the_human_line_still_yields_the_adapter_name() {
+        let stderr = "Device probe: AMD Radeon(TM) Graphics (spirv_4098_5688) ok (sum 32768)\n";
+        assert_eq!(
+            stderr_adapter(stderr).as_deref(),
+            Some("AMD Radeon(TM) Graphics (spirv_4098_5688)")
+        );
+        assert_eq!(stderr_adapter("no probe output"), None);
+    }
+
+    /// One line in the UI, but a backtrace can be thousands of characters in the log.
+    #[test]
+    fn a_reason_is_clamped_but_not_mangled() {
+        let long = "x".repeat(500);
+        let clamped = clamp(&long);
+        assert_eq!(clamped.chars().count(), 301, "300 plus the ellipsis");
+        assert!(clamped.ends_with('…'));
+        assert_eq!(clamp("short"), "short");
+        // Clamping counts characters, not bytes: a multi-byte message must not be cut mid-codepoint.
+        let wide = "显".repeat(400);
+        assert_eq!(clamp(&wide).chars().count(), 301);
+    }
+
     #[test]
     fn hub_drops_dead_subscribers() {
         let hub = Hub::default();
@@ -740,5 +1023,45 @@ mod tests {
             matches!(kind, Some("start") | Some("epoch")),
             "unexpected first event: {event}"
         );
+    }
+
+    /// End to end through a real child process. The point is not that this machine's GPU works —
+    /// it does not — but that a probe always *answers*: an ok, a reason, or the timeout sentence,
+    /// and never a panic escaping into the shell or an empty reply with no explanation.
+    #[test]
+    #[ignore = "spawns the real engine"]
+    fn probing_the_real_engine_answers_for_both_devices() {
+        let Ok(engine) = resolve(None) else {
+            return;
+        };
+
+        let cpu = probe(&engine, "cpu");
+        assert!(cpu.ok, "the cpu probe must succeed: {:?}", cpu.reason);
+        assert_eq!(cpu.device, "cpu", "the report echoes what was asked");
+        assert_eq!(cpu.backend.as_deref(), Some("cpu"));
+
+        let gpu = probe(&engine, "gpu");
+        assert!(
+            gpu.ok || gpu.reason.is_some(),
+            "a failed probe must say why: {gpu:?}"
+        );
+        // A working adapter answers in about a second; a broken one spends the whole deadline.
+        assert!(gpu.elapsed_ms < 60_000, "probe outlived its own timeout");
+
+        // The packaged sidecar is the engine that speaks `--json`; `resolve` above may well have
+        // found a stale build from the repository layout instead. Both dialects must answer, which
+        // is the whole reason the retry exists.
+        let sidecar = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("binaries")
+            .join("montgomery-x86_64-pc-windows-msvc.exe");
+        if sidecar.is_file() {
+            let report = probe(&sidecar, "cpu");
+            assert!(report.ok, "the sidecar probe failed: {:?}", report.reason);
+            assert_eq!(report.backend.as_deref(), Some("cpu"));
+            assert!(
+                report.reason.is_none(),
+                "a successful probe carries no excuse: {report:?}"
+            );
+        }
     }
 }

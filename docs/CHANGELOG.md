@@ -1,5 +1,39 @@
 # 变更记录
 
+## 2026-11-14 · 训练前预检设备；监控页补验证指标
+
+两件小事，都是「用户/客户端本来只能靠跑一次失败来知道」的信息，挪到了开跑之前和过程之中。
+
+**设备预检（`__device-probe --json` / `GET /device` / `probe_device`）**
+- 引擎探针加 `--json`，输出 `{ok, device, backend, adapter, sum}`。问的不是「装了什么卡」而是
+  「能不能算」——驱动可以创建设备后在第一次回读失败，本项目开发机就是这样。
+- 壳侧 `engine::probe()`：单独子进程 + 40 秒卡死上限（设备创建失败时会挂住而不报错）、
+  双线程排空管道（panic 的回溯会写满管道，不排空就把「崩溃」变成「超时」）、
+  按设备缓存到进程退出。
+- **兼容旧引擎**：`--json` 不认时 clap 返回 `error: unexpected argument`，此时自动去掉该参数
+  重试，从 `Device probe: <adapter> ok (sum N)` 里抠出显卡名。这条真被测试踩到了——
+  `resolve()` 在仓库布局里找到的是一份旧构建。
+- `reason` 取引擎原话：干净失败是 `error [CODE]: …`；崩溃取 panic 帧**下一行**（帧本身只有
+  源码位置，对用户没用）；clap 用法错误取 `error:` 那一行（原来会取到
+  `For more information, try '--help'.`，什么都没说）。
+- 界面：训练页「计算设备」卡片下方一行——显卡名 · 后端 · 无需安装 CUDA；跑不起来时显示原因
+  并说明自动模式会退回 CPU；带「重新检测」按钮。
+
+**监控页验证指标**
+- `store` 记录 `lastFitness` 与启动时的任务类型，监控页新增一个指标：检测/分割是
+  「验证 mAP50-95」，分类是「验证准确率」，`--no-val` 显示「—」而不是 0。
+- 需求来源：`last_loss` 在只背下 4 张图的模型上照样下降，它不能回答「模型好不好」。
+
+**验证**：`cargo test` 91 passed / 5 ignored（新增 5 条，含一条真实引擎的 `--ignored` 端到端：
+CPU 必须成功、GPU 必须给出 ok 或原因、耗时不超时）；`tsc --noEmit` 通过；`npm run build` 通过。
+`docs/API.md` 增 8 节 `probe_device` 与 9.12 节 `GET /device`。
+
+**补丁补债**：`patches/0006`。引擎的 `--json` 与 `lib.rs` 的 `wgpu_device_from_env()` /
+`default_wgpu_device()` 都只存在于 `research/`（已 gitignore），不出补丁等于没改——
+`lib.rs` 那两个函数是更早一轮漏的，这次一起补上。**顺带发现 0001 与 0004 在
+`export/mod.rs` 的 hunk 重叠，`git apply ../../patches/*.patch` 会失败**，只能 `--3way` 后人工
+合并；已写进 `patches/README.md`，暂不重修（要重导 0001–0005，等下次必须重建引擎时做）。
+
 ## 2026-11-14 · 回馈上游：7 个 fix 拆成 2 个 PR，cubecl 另提 1 个 issue
 
 起因是「有要提交给上游的东西吗」。把本地对 `research/montgomery` 的 13 个文件改动逐个过了一遍，
